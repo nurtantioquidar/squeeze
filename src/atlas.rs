@@ -59,7 +59,28 @@ pub fn load(path: &Path) -> Result<AtlasFile> {
     if file.bundles.is_empty() || file.bundles.iter().any(|b| b.tasks.is_empty()) {
         bail!("{} needs at least one [[atlas_bundle]] with tasks", path.display());
     }
+    file.defaults.check().with_context(|| format!("in {}", path.display()))?;
     Ok(file)
+}
+
+/// The agent's prompt-cache lifetime for a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTtl {
+    /// Claude Code's own: one hour on a subscription, five minutes on an API key.
+    Client,
+    /// One hour for every arm (`ENABLE_PROMPT_CACHING_1H=1`).
+    OneHour,
+}
+
+impl std::str::FromStr for CacheTtl {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim() {
+            "client" => Ok(CacheTtl::Client),
+            "1h" => Ok(CacheTtl::OneHour),
+            other => bail!("unknown cache TTL {other:?} (client, 1h)"),
+        }
+    }
 }
 
 pub struct Task {
@@ -207,13 +228,15 @@ pub struct AtlasCtx<'a> {
     pub squeeze_linux: PathBuf,
     /// Env file with CLAUDE_CODE_OAUTH_TOKEN (subscription runs). Passed by path only.
     pub token_env_file: Option<PathBuf>,
-    /// Env file with ANTHROPIC_API_KEY for the squeeze-proxy arm's agent (the
-    /// proxy accepts API keys only). Passed by path only; other arms keep `--auth`.
+    /// Env file with ANTHROPIC_API_KEY for the proxied arms' agent (the proxy
+    /// accepts API keys only). Passed by path only; other arms keep `--auth`.
     pub api_key_env_file: Option<PathBuf>,
-    /// The squeeze proxy as the containers reach it, for the squeeze-proxy arm.
-    pub proxy_url: Option<String>,
+    /// The squeeze proxy each proxied arm reaches from the containers.
+    pub proxy_urls: BTreeMap<Arm, String>,
     /// Extra KEY=VALUE environment for the agent (e.g. a gateway URL).
     pub agent_env: Vec<String>,
+    /// The agent's prompt-cache lifetime. Arms compare fairly only at the same one.
+    pub cache_ttl: CacheTtl,
     pub cpus: u32,
     pub memory: String,
     pub dns: Vec<String>,
@@ -376,12 +399,12 @@ async fn session_inner(
     sdir: &Path,
     res: &mut SessionResult,
 ) -> Result<()> {
-    if arm == Arm::SqueezeProxy {
-        if ctx.proxy_url.is_none() {
-            bail!("the squeeze-proxy arm needs the proxy running (bench-atlas starts it when the arm is selected)");
+    if arm.is_proxied() {
+        if !ctx.proxy_urls.contains_key(&arm) {
+            bail!("the {} arm needs its proxy running (bench-atlas starts it when the arm is selected)", arm.name());
         }
         if ctx.api_key_env_file.is_none() && ctx.host.auth != Auth::ApiKey {
-            bail!("the squeeze-proxy arm needs an API key: --api-key-env-file, or --auth api-key");
+            bail!("the {} arm needs an API key: --api-key-env-file, or --auth api-key", arm.name());
         }
     } else if ctx.host.auth == Auth::Subscription && ctx.token_env_file.is_none() {
         bail!("subscription runs inside containers need --token-env-file (a `claude setup-token` token)");
@@ -694,14 +717,12 @@ async fn run_ticket(
     let timeout = d.timeout_secs.unwrap_or(10_800);
     let mut conversation: Vec<String> = Vec::new();
     loop {
-        let mut env = res.arm.env();
-        if res.arm == Arm::SqueezeProxy
-            && let Some(url) = &ctx.proxy_url
+        if tr.pushbacks > 0
+            && let Some(p) = d.turn_pause(res.agent.invocations + 1)
         {
-            env.push(("ANTHROPIC_BASE_URL", url.clone()));
-            // Same cache lifetime as subscription sessions (API-key sessions default to 5 minutes).
-            env.push(("ENABLE_PROMPT_CACHING_1H", "1".into()));
+            tokio::time::sleep(p).await;
         }
+        let env = agent_env(res.arm, ctx.proxy_urls.get(&res.arm).map(String::as_str), ctx.cache_ttl);
         let mut cmd = exec_cmd(ctx, name, &bundle.workdir, bundle.agent_path.as_deref(), &env);
         cmd.arg(format!("{TOOLS_DIR}/claude")).args(agent_args(*started));
         let result = bench::run_claude_command(cmd, &message, timeout).await?;
@@ -743,6 +764,21 @@ async fn run_ticket(
         tr.pushbacks += 1;
     }
     Ok(tr)
+}
+
+/// The agent's environment: the arm's own, the proxy for a proxied arm, and
+/// the run's cache lifetime.
+fn agent_env(arm: Arm, proxy_url: Option<&str>, ttl: CacheTtl) -> Vec<(&'static str, String)> {
+    let mut env = arm.env();
+    if arm.is_proxied()
+        && let Some(url) = proxy_url
+    {
+        env.push(("ANTHROPIC_BASE_URL", url.to_string()));
+    }
+    if ttl == CacheTtl::OneHour {
+        env.push(("ENABLE_PROMPT_CACHING_1H", "1".into()));
+    }
+    env
 }
 
 async fn capture_patch(ctx: &AtlasCtx<'_>, name: &str, workdir: &str) -> Result<String> {
@@ -1061,6 +1097,18 @@ mod tests {
         std::fs::write(project.join(format!("{sid}.jsonl")), "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n")
             .unwrap();
         assert_ne!(transcript_bytes(&cfg, sid), cp.transcript_bytes);
+    }
+
+    #[test]
+    fn cache_ttl_is_the_clients_unless_set_for_the_run() {
+        let has = |env: &[(&str, String)], k: &str| env.iter().any(|(e, _)| *e == k);
+        let proxied = agent_env(Arm::SqueezeProxy, Some("http://h:1"), "client".parse().unwrap());
+        assert!(has(&proxied, "ANTHROPIC_BASE_URL"));
+        assert!(!has(&proxied, "ENABLE_PROMPT_CACHING_1H"), "an API key keeps Claude Code's own TTL");
+        let vanilla = agent_env(Arm::Vanilla, Some("http://h:1"), "1h".parse().unwrap());
+        assert!(has(&vanilla, "ENABLE_PROMPT_CACHING_1H"), "1h applies to every arm");
+        assert!(!has(&vanilla, "ANTHROPIC_BASE_URL"));
+        assert!("5m".parse::<CacheTtl>().is_err());
     }
 
     #[test]

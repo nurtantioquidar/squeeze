@@ -12,6 +12,12 @@ pub fn approx_tokens(bytes: usize) -> f64 {
     bytes as f64 / 4.0
 }
 
+/// Price of a cache read as a multiple of the base input price: Opus 5.5 and
+/// Sonnet 5.5 bill cache hits at 0.05x, earlier models at 0.1x.
+pub fn read_price(model: &str) -> f64 {
+    if model.starts_with("claude-opus-5-5") || model.starts_with("claude-sonnet-5-5") { 0.05 } else { 0.1 }
+}
+
 /// Stable short hash of several string parts.
 pub fn short_hash(parts: &[&str]) -> String {
     let mut h = blake3::Hasher::new();
@@ -45,6 +51,15 @@ mod tests {
     fn truncates_on_char_boundaries() {
         assert_eq!(truncate_chars("héllo", 2), "hé…");
         assert_eq!(truncate_chars("hi", 5), "hi");
+    }
+
+    #[test]
+    fn read_price_by_model() {
+        assert_eq!(read_price("claude-opus-5-5"), 0.05);
+        assert_eq!(read_price("claude-sonnet-5-5-20261001"), 0.05);
+        assert_eq!(read_price("claude-haiku-5-5"), 0.1);
+        assert_eq!(read_price("claude-opus-5"), 0.1);
+        assert_eq!(read_price(""), 0.1);
     }
 
     #[test]

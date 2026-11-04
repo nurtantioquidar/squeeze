@@ -11,14 +11,17 @@
 
 mod common;
 
-use common::{Recorded, Reply, sse_text, sse_tool_use, tool_result_text};
+use common::server::{self, Api, Served};
+use common::{FakeClock, Recorded, Reply, sse_text, sse_tool_use, tool_result_text};
 use regex::Regex;
 use serde_json::{Value, json};
-use squeeze::proxy::{Proxy, ProxyConfig};
+use squeeze::ctxmgmt::{CtxConfig, KeepWindow};
+use squeeze::proxy::{Proxy, ProxyConfig, Totals};
 use squeeze::store::Store;
 use squeeze::transform::{ExpandHint, TransformConfig};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 const FAKE_KEY: &str = "sk-ant-api03-mock-key-not-real";
@@ -122,6 +125,7 @@ async fn real_claude_code_through_squeeze() {
         upstream: mock.url(),
         transform: Some(TransformConfig { expand_hint: ExpandHint::Mcp, ..Default::default() }),
         store,
+        ctx: None,
     })
     .unwrap();
     let addr = proxy.spawn("127.0.0.1:0").await.unwrap();
@@ -217,6 +221,288 @@ async fn real_claude_code_through_squeeze() {
     eprintln!("\nproxy totals: {}", serde_json::to_string(&t).unwrap());
     assert_eq!(t.refused, 0);
     assert!(t.compressed >= 1 && t.deduped >= 1);
+}
+
+/// Files the `--context-edits` sessions read, one per tool call.
+const CM_READS: usize = 12;
+/// The first run reads this many; the second, resumed with a new prompt, the rest.
+const CM_FIRST_RUN: usize = 6;
+/// The fake clock's step per request, and the pauses past a 5-minute cache's lifetime.
+const CM_STEP: u64 = 10;
+const CM_PAUSE: u64 = 400;
+
+fn cm_file(i: usize) -> String {
+    (0..200).map(|l| format!("{i}.{l}\tlet value_{i}_{l} = compute({l});\n")).collect()
+}
+
+/// What reached the emulated API in a `--context-edits cold` session, and what the proxy recorded.
+struct CmSession {
+    /// Main-thread messages requests: their `anthropic-beta` header and body.
+    requests: Vec<(String, Value)>,
+    /// The emulated API's view of each.
+    served: Vec<Served>,
+    /// Each one's `ctx` stats line.
+    ctx: Vec<Value>,
+    totals: Totals,
+}
+
+/// `cache_control` markers in a request body, as (where, TTL).
+fn cache_markers(body: &Value) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let mut visit = |at: String, b: &Value| {
+        if let Some(cc) = b.get("cache_control") {
+            out.push((at, cc["ttl"].as_str().map(str::to_string)));
+        }
+    };
+    for (i, s) in body["system"].as_array().into_iter().flatten().enumerate() {
+        visit(format!("system.{i}"), s);
+    }
+    for (i, m) in body["messages"].as_array().into_iter().flatten().enumerate() {
+        for (j, b) in m["content"].as_array().into_iter().flatten().enumerate() {
+            visit(format!("messages.{i}.content.{j}"), b);
+        }
+    }
+    out
+}
+
+/// Two `claude -p` runs on one conversation through `--context-edits cold`
+/// to the emulated API (free): the first reads 6 files one at a time, the
+/// second (`--resume`, a new prompt) the other 6. The fake clock moves 10 s
+/// per request, so a 5-minute cache stays warm, except for two 400 s pauses:
+/// before the second prompt, and after its fourth read. With `one_hour`,
+/// Claude Code runs with `ENABLE_PROMPT_CACHING_1H`.
+async fn context_edits_session(one_hour: bool) -> CmSession {
+    let claude = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    for i in 0..CM_READS {
+        std::fs::write(work.join(format!("f{i}.txt")), cm_file(i)).unwrap();
+    }
+    let home = tmp.path().join("squeeze-home");
+    let clock = Arc::new(FakeClock::default());
+    clock.set(1_000_000);
+    let api = Api::new(clock.clone());
+    let (answer, ticks) = (api.clone(), clock.clone());
+    let mock = common::start(Arc::new(move |r: &Recorded| {
+        let body = r.json();
+        match r.path.as_str() {
+            "/v1/messages/count_tokens" => return answer.respond(r, vec![], ""),
+            "/v1/messages" if is_main_thread(&body) => {}
+            _ => return script(r),
+        }
+        let messages = body["messages"].as_array().unwrap();
+        let uses =
+            messages.iter().flat_map(|m| server::blocks(m).into_owned()).filter(|b| b["type"] == "tool_use").count();
+        let prompted = messages.last().is_some_and(|m| server::blocks(m).iter().all(|b| b["type"] != "tool_result"));
+        let read = uses < CM_FIRST_RUN || (uses < CM_READS && (uses > CM_FIRST_RUN || prompted));
+        let reply = if read {
+            let input = json!({ "command": format!("cat f{uses}.txt"), "description": "Read a file" });
+            answer.respond(
+                r,
+                vec![json!({ "type": "tool_use", "id": format!("toolu_cm_{uses}"), "name": "Bash", "input": input })],
+                "tool_use",
+            )
+        } else {
+            answer.respond(r, vec![json!({ "type": "text", "text": "done" })], "end_turn")
+        };
+        let pause = read && uses == CM_FIRST_RUN + 3;
+        ticks.0.fetch_add(if pause { CM_PAUSE } else { CM_STEP }, Ordering::SeqCst);
+        reply
+    }))
+    .await;
+    let ctx = CtxConfig { window: KeepWindow { min: 4, max: 4 }, ..Default::default() };
+    let transform = TransformConfig { ctx_window: Some(ctx.window), ..Default::default() };
+    let cfg = ProxyConfig {
+        upstream: mock.url(),
+        transform: Some(transform),
+        store: Store::open(&home).unwrap(),
+        ctx: Some(ctx),
+    };
+    let proxy = Proxy::with_clock(cfg, clock.clone()).unwrap();
+    let addr = proxy.spawn("127.0.0.1:0").await.unwrap();
+
+    let mut session: Option<String> = None;
+    for prompt in ["Read the files one at a time.", "Now read the rest, one at a time."] {
+        let mut cmd = tokio::process::Command::new(&claude);
+        cmd.current_dir(&work)
+            .args(["-p", prompt, "--bare", "--output-format", "json"])
+            .args(["--model", "claude-opus-5-5", "--allowedTools", "Bash"])
+            .env("ANTHROPIC_BASE_URL", format!("http://{addr}"))
+            .env("ANTHROPIC_API_KEY", FAKE_KEY)
+            .env("CLAUDE_CONFIG_DIR", tmp.path().join("claude-config"))
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env("DISABLE_AUTOUPDATER", "1")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .env_remove("ENABLE_PROMPT_CACHING_1H")
+            .stdin(Stdio::null());
+        if one_hour {
+            cmd.env("ENABLE_PROMPT_CACHING_1H", "1");
+        }
+        if let Some(id) = &session {
+            cmd.arg("--resume").arg(id);
+            clock.0.fetch_add(CM_PAUSE, Ordering::SeqCst);
+        }
+        let out =
+            tokio::time::timeout(Duration::from_secs(240), cmd.output()).await.expect("claude timed out").unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "claude failed\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let result: Value = serde_json::from_str(stdout.trim()).expect("claude JSON output");
+        assert_eq!(result["result"], "done", "Claude Code accepts applied_edits and keeps going: {result}");
+        session = result["session_id"].as_str().map(str::to_string);
+    }
+
+    let requests: Vec<(String, Value)> = mock
+        .requests()
+        .iter()
+        .filter(|r| r.path == "/v1/messages")
+        .map(|r| (r.headers.get("anthropic-beta").map_or("", |v| v.to_str().unwrap()).to_string(), r.json()))
+        .filter(|(_, b)| is_main_thread(b))
+        .collect();
+    let served: Vec<Served> = api.served().into_iter().filter(|s| s.path == "/v1/messages").collect();
+    let ctx: Vec<Value> =
+        Store::open(&home).unwrap().records().unwrap().into_iter().filter_map(|r| r.get("ctx").cloned()).collect();
+    let (beta, first) = &requests[0];
+    eprintln!("Claude Code on claude-opus-5-5 (ENABLE_PROMPT_CACHING_1H {}):", if one_hour { "on" } else { "off" });
+    eprintln!("  anthropic-beta: {beta}");
+    eprintln!("  context_management: {}", first["context_management"]);
+    eprintln!("  thinking: {}, output_config: {}", first["thinking"], first["output_config"]);
+    eprintln!("  cache markers: {:?}", cache_markers(first));
+    eprintln!("  proxy totals: {}", serde_json::to_string(&proxy.totals()).unwrap());
+    for (s, l) in served.iter().zip(&ctx) {
+        eprintln!(
+            "  request at +{:>4} s: read {:>7.0} write {:>6.0} | cold {} advance {} C {} C_th {} applied {}{}",
+            s.at - 1_000_000,
+            s.read,
+            s.write,
+            l["cold"],
+            l["advance"],
+            l["C"],
+            l["C_th"],
+            serde_json::to_string(&s.applied).unwrap(),
+            s.error.as_ref().map_or(String::new(), |e| format!(" REFUSED: {e}"))
+        );
+    }
+    CmSession { requests, served, ctx, totals: proxy.totals() }
+}
+
+impl CmSession {
+    /// What Claude Code sends on every main-thread request, whatever the cache TTL.
+    fn assert_claude_codes_shape(&self, ttl: Option<&str>) {
+        assert_eq!(self.requests.len(), CM_READS + 2, "a request per read and per reply");
+        assert_eq!((self.served.len(), self.ctx.len()), (self.requests.len(), self.requests.len()));
+        for (beta, b) in &self.requests {
+            let betas: Vec<&str> = beta.split(',').collect();
+            assert!(betas.contains(&"context-management-2025-06-27"), "{beta}");
+            assert!(!beta.contains("message-threads"), "{beta}");
+            assert_eq!(betas.contains(&"extended-cache-ttl-2025-04-11"), ttl == Some("1h"), "{beta}");
+            assert_eq!(b["thinking"]["type"], "adaptive");
+            let edits = b["context_management"]["edits"].as_array().expect("Claude Code sends context_management");
+            assert_eq!(edits[0]["type"], "clear_thinking_20251015", "Claude Code's own edit, first");
+            let markers = cache_markers(b);
+            assert!(markers.len() <= 4 && markers.iter().all(|(_, t)| t.as_deref() == ttl), "{markers:?}");
+            // The last block is marked: Claude Code's effort message after the first prompt has none.
+            let messages = b["messages"].as_array().unwrap();
+            let last = messages.iter().rposition(|m| !server::blocks(m).is_empty()).unwrap();
+            let block = server::blocks(&messages[last]).len() - 1;
+            assert!(markers.iter().any(|(at, _)| *at == format!("messages.{last}.content.{block}")), "{markers:?}");
+            // Message bytes are Claude Code's own: every result as the command printed it.
+            for i in 0..CM_READS {
+                if let Some(text) = tool_result_text(b, &format!("toolu_cm_{i}")) {
+                    assert_eq!(text.trim_end(), cm_file(i).trim_end(), "result {i}");
+                }
+            }
+        }
+        let refused: Vec<&String> = self.served.iter().filter_map(|s| s.error.as_ref()).collect();
+        assert!(refused.is_empty(), "the API refused {refused:?}");
+        let last = &self.requests.last().unwrap().1;
+        let emitted = last["messages"].as_array().unwrap().iter().flat_map(|m| server::blocks(m).into_owned());
+        let bound = emitted.filter(|b| b["signature"].as_str().is_some_and(|s| s.starts_with("emu-sig-"))).count();
+        assert_eq!(bound, CM_READS + 1, "every thinking block came back and verified");
+        assert!(self.ctx.iter().all(|l| l["breakers"] == json!([])), "{:?}", self.ctx);
+    }
+}
+
+/// Real Claude Code through `--context-edits cold` against the emulated API.
+/// Until the first cold moment the proxy leaves Claude Code's own
+/// `context_management` alone; from it on, a numeric thinking `keep` and a
+/// `clear_tool_uses` edit after it pin what the server clears. The API
+/// accepts every request (thinking blocks verify across the resume),
+/// reports what it cleared in `message_delta`, and between the two cold
+/// moments its view only grows, so each warm request reads the whole
+/// previous prompt from cache.
+#[tokio::test]
+#[ignore = "needs the claude CLI; run with --ignored"]
+async fn real_claude_code_with_context_edits() {
+    let s = context_edits_session(false).await;
+    s.assert_claude_codes_shape(None);
+    let cold: Vec<usize> = (0..s.ctx.len()).filter(|&i| s.ctx[i]["cold"] == true).collect();
+    assert_eq!(cold, [CM_FIRST_RUN + 1, CM_FIRST_RUN + 5], "the second prompt, and after its fourth read");
+    let own = json!([{ "type": "clear_thinking_20251015", "keep": "all" }]);
+    for (i, ((_, b), (served, line))) in s.requests.iter().zip(s.served.iter().zip(&s.ctx)).enumerate() {
+        let edits = &b["context_management"]["edits"];
+        if i < cold[0] {
+            assert_eq!(edits, &own, "{i}: Claude Code's own, until the cache is cold");
+            assert!(served.applied.is_empty());
+            continue;
+        }
+        // Pinned: the oldest C uses and C_th thinking turns, as the server reported.
+        let (c, c_th) = (line["C"].as_u64().unwrap(), line["C_th"].as_u64().unwrap());
+        assert_eq!(line["advance"], cold.contains(&i), "{i}: an advance at each cold moment, and only there");
+        let uses = b["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| server::blocks(m).into_owned())
+            .filter(|x| x["type"] == "tool_use");
+        let n = uses.count() as u64;
+        let thinking_turns =
+            b["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "assistant").count() as u64;
+        let mut ours = json!({ "type": "clear_tool_uses_20250919", "trigger": { "type": "tool_uses", "value": n - 1 },
+                               "keep": { "type": "tool_uses", "value": n - c } });
+        // Every offered tool but the clearable ones (none, with `--bare`'s Bash, Edit and Read).
+        let mut others: Vec<&str> = b["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        others.retain(|t| !squeeze::ctxmgmt::is_clearable(t));
+        others.sort();
+        if !others.is_empty() {
+            ours["exclude_tools"] = json!(others);
+        }
+        let thinking = json!({ "type": "clear_thinking_20251015", "keep": { "type": "thinking_turns", "value": thinking_turns - c_th } });
+        assert_eq!(edits, &json!([thinking, ours]), "{i}");
+        assert_eq!((served.cleared("cleared_tool_uses"), served.cleared("cleared_thinking_turns")), (c, c_th));
+    }
+    assert_eq!(s.totals.ctx_advances, 2);
+    assert_eq!((s.ctx[cold[0]]["C"].clone(), s.ctx[cold[1]]["C"].clone()), (json!(2), json!(6)));
+    for (i, w) in s.served.windows(2).enumerate().map(|(i, w)| (i + 1, w)) {
+        if cold.contains(&i) {
+            assert_eq!(w[1].read, 0.0, "{i}: expired");
+        } else {
+            assert!(w[1].extends(&w[0]), "{i}: the server's view grows append-only between advances");
+            assert_eq!(w[1].read, w[0].read + w[0].write + w[0].input, "{i}: the whole previous prompt is read");
+        }
+    }
+}
+
+/// With `ENABLE_PROMPT_CACHING_1H`, Claude Code marks every breakpoint
+/// 1-hour, so the same 400 s pauses leave the cache warm: the proxy never
+/// edits, and every request reads the whole previous prompt.
+#[tokio::test]
+#[ignore = "needs the claude CLI; run with --ignored"]
+async fn one_hour_cache_markers_never_go_cold_on_short_pauses() {
+    let s = context_edits_session(true).await;
+    s.assert_claude_codes_shape(Some("1h"));
+    let own = json!([{ "type": "clear_thinking_20251015", "keep": "all" }]);
+    assert!(s.requests.iter().all(|(_, b)| b["context_management"]["edits"] == own));
+    assert!(s.ctx.iter().all(|l| l["cold"] == false && l["advance"] == false));
+    for w in s.served.windows(2) {
+        assert!(w[1].extends(&w[0]));
+        assert_eq!(w[1].read, w[0].read + w[0].write + w[0].input);
+    }
 }
 
 /// `squeeze run --proxy`: credential preflight, proxy, MCP wiring and
@@ -325,7 +611,7 @@ fn proxy_mode_requires_api_credentials_hook_mode_does_not() {
     assert!(!ok && err.contains("could not start"), "{err}");
 }
 
-/// `squeeze bench` end to end against the mock (free): all five arms, a
+/// `squeeze bench` end to end against the mock (free): every arm, a
 /// two-ticket resumed session, simulated-user pushback, judge scoring, resume.
 #[tokio::test]
 #[ignore = "needs the claude CLI; run with --ignored"]
@@ -373,7 +659,7 @@ rubric = "anything"
             .arg(&results)
             .args([
                 "--arms",
-                "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-hook,squeeze-mcp,squeeze-proxy",
+                "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-hook,squeeze-mcp,squeeze-proxy,squeeze-proxy-cm",
             ])
             .args(extra)
             .env("ANTHROPIC_API_KEY", FAKE_KEY)
@@ -393,7 +679,7 @@ rubric = "anything"
 
     let rows: Vec<Value> =
         std::fs::read_to_string(&results).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(rows.len(), 8, "one session per arm");
+    assert_eq!(rows.len(), 9, "one session per arm");
     let mut pushbacks = 0;
     for r in &rows {
         assert!(r["error"].is_null(), "{r}");

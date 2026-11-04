@@ -17,7 +17,7 @@ Everything runs on your machine.
 |---|---|---|
 | How | Claude Code's documented [`PostToolUse` hook](https://code.claude.com/docs/en/hooks) rewrites tool output before Claude sees it | A local proxy on `ANTHROPIC_BASE_URL` rewrites `tool_result` text in API requests |
 | Credentials | **Any**: subscription login, `claude setup-token`, API key. squeeze never sees credentials or API traffic | **API key or gateway credential only** |
-| Extras | | Replaces repeated identical outputs with references; experimental cold-cache pruning |
+| Extras | | Replaces repeated identical outputs with references; experimental cold-cache pruning and server-side context editing |
 
 Anthropic's terms do not allow third-party tools to route or intermediate Claude
 subscription (Free/Pro/Max/Ultra) credentials
@@ -156,6 +156,55 @@ squeeze run --proxy
 squeeze proxy --port 8787            # standalone, for IDE extensions or scripts
 ```
 
+**Server-side context editing** (experimental, `--context-edits cold`, proxy
+mode only). The proxy asks the API to clear old tool results and thinking,
+through the `context_management` field Claude Code already sends. It never
+edits the messages themselves. What's cleared moves forward only when the
+prompt cache has already expired, and stays fixed in between, so the other
+requests keep reading the history from cache.
+
+- **What's cleared:** results of Read, Grep, Glob, Edit, Write, NotebookEdit,
+  Bash and squeeze's own tools. The newest ones stay: those since the start of
+  the previous human turn, at least `--keep-tool-uses` (8) and at most
+  `--keep-tool-uses-max` (24). Thinking from before the latest prompt is
+  cleared too, always keeping the most recent thinking turn
+  (`--clear-thinking false` keeps it all). `--clear-tool-inputs` also clears
+  those calls' inputs, including the text of the agent's older Edit and Write
+  calls.
+- **When it helps:** sessions that pause longer than the cache lifetime, such
+  as an API key's 5-minute cache. With a 1-hour cache and shorter pauses,
+  nothing moves.
+- **Unchanged files and repeats:** when Claude Code answers a Read with "File
+  unchanged since last read" and the earlier Read is old enough to be cleared,
+  the proxy sends the earlier content in its place. That costs tokens even
+  when nothing ends up cleared (with a 1-hour cache, say), and is counted as a
+  cost in the savings estimate. Likewise squeeze replaces a repeated output
+  with a reference only to a copy recent enough not to be cleared.
+- **Safeguards:** a conversation stops moving forward if the API reports
+  clearing something other than what was asked, or if a request well within
+  the cache lifetime didn't read the cache (a response cut short, or the first
+  one after a model switch, doesn't count). After the second cache miss it
+  goes back to Claude Code's own setting at the next expired-cache moment, and
+  right away if a request is refused. Each line in `~/.squeeze/stats.jsonl`
+  records what was asked, what the API cleared and any `breakers` tripped
+  (`ctx`).
+- **Status:** off by default. Whether the API's prompt cache holds across
+  these edits as expected still needs a paid probe. It can't be combined with
+  `--prune-cold-cache`.
+- **Estimating it offline:** `squeeze replay --cache-sim <transcripts>`
+  rebuilds every request of Claude Code 2.1.317+ transcripts, runs them through
+  the proxy's own context-editing logic (unchanged-file refills included;
+  compression and dedup left out), and prices them with a prompt-cache model
+  against the same session sent unchanged. `--regime 5m-fermat` (default)
+  is a 5-minute cache with SessionBench's 330 s pauses before each new ticket
+  and every third human turn; `1h` keeps the recorded timing. It takes the
+  proxy's `--keep-tool-uses`, `--keep-tool-uses-max`, `--clear-tool-inputs` and
+  `--clear-thinking`, plus `--read-price`, `--placeholder` (tokens left per
+  cleared item, 60) and `--reread` (share of cleared results the agent reads
+  back). On the four grafana_ts sessions below, at 5m-fermat with a read price
+  of 0.1 / 0.05: 0.66 / 0.67 of the unchanged cost with the defaults, 0.54 /
+  0.56 keeping 8 tool uses with inputs cleared, and 1.00 under a 1-hour cache.
+
 ## Benchmarking
 
 `squeeze bench` follows the structure of SessionBench, the benchmark published
@@ -185,6 +234,7 @@ It goes beyond that methodology in a few ways:
   - `squeeze-hook`: compression only
   - `squeeze-mcp`: tools only
   - `squeeze-proxy`: proxy compression (API key only)
+  - `squeeze-proxy-cm`: `squeeze-proxy` plus `--context-edits cold` (API key only)
 - **A paired bootstrap 95% CI** on the cost ratio.
 - **Resume after a usage limit.** Rerun the same command and finished sessions
   are skipped.
@@ -258,6 +308,14 @@ runtime, the default on macOS) or `--runtime docker`. If your Mac uses a local
 DNS resolver (a VPN or filter app), containers can't resolve names: pass
 `--dns 1.1.1.1`.
 
+**Pauses and cache lifetime.** `pause_between_tickets_secs` in `[defaults]`
+idles before each ticket; `pause_every_n_turns = 3` also idles that long before
+every third user message, as SessionBench did for Fermat (330 s each).
+`--cache-ttl` sets the agent's prompt-cache lifetime: `client` (the default) is
+Claude Code's own, one hour on a subscription and five minutes on an API key;
+`1h` sets `ENABLE_PROMPT_CACHING_1H` for every arm. Compare arms only at the
+same lifetime.
+
 Every arm, vanilla included, runs the agent with Claude Code's
 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`. With background commands on,
 `claude -p` can return while a command is still running. Its result then misses
@@ -316,9 +374,10 @@ Findings from setting this up:
 
 | Command | Cost | What it tells you |
 |---|---|---|
-| `cargo test` | free | compression rules, cache stability, credential refusal, stream handling, hook output shape, MCP tools, benchmark statistics |
-| `cargo test --test e2e_claude -- --include-ignored` | free | the real `claude` CLI against a scripted local mock API: hook mode, proxy mode, and `squeeze bench` across all five arms. Uses a dummy key and an isolated config dir, so nothing reaches Anthropic |
+| `cargo test` | free | compression rules, cache stability, credential refusal, stream handling, hook output shape, MCP tools, benchmark statistics, and `--context-edits` on a rebuilt session paced like Fermat's runs, sent through the proxy to an emulated API that applies the edits, caches the edited prompt and checks thinking blocks; its cache numbers must match `--cache-sim`'s |
+| `cargo test --test e2e_claude -- --include-ignored` | free | the real `claude` CLI against a scripted local mock API: hook mode, proxy mode with and without context editing (against the emulated API, with 5-minute and 1-hour cache markers), and `squeeze bench` across every arm. Uses a dummy key and an isolated config dir, so nothing reaches Anthropic |
 | `squeeze replay` | free, offline | applies the compression rules to your past transcripts (`~/.claude/projects`) and prices them against the recorded usage |
+| `squeeze replay --cache-sim` | free, offline | replays past requests through `--context-edits cold` and a prompt-cache model, against the same sessions sent unchanged |
 
 ## Results so far
 
@@ -379,7 +438,7 @@ Contributed results are welcome.
   `PostToolUseFailure`, whose output can't be replaced: in testing, both
   `updatedToolOutput` and `additionalContext` left the output unchanged. Claude
   Code itself already trims failing output to about 10k characters. Proxy mode
-  (API key) compresses failing output too.
+  doesn't compress it either: it never rewrites a tool result marked as an error.
 - Token figures in `stats` and `replay` are estimates (~4 bytes per token).
 - Claude Code's `Edit` still requires a `Read` of the file first, so reading
   through `read_many` alone is not enough before editing.

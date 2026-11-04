@@ -9,7 +9,7 @@
 use crate::sse::Usage;
 use crate::store::Store;
 use crate::transform::{self, BlobSink, TransformConfig};
-use crate::util::approx_tokens;
+use crate::util::{approx_tokens, read_price};
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -39,7 +39,7 @@ impl Report {
 }
 
 /// Computes blob ids without writing anything.
-struct DryRun;
+pub(crate) struct DryRun;
 impl BlobSink for DryRun {
     fn put(&mut self, text: &str) -> String {
         Store::blob_id(text)
@@ -73,6 +73,7 @@ fn parse(path: &Path) -> Result<(Vec<Vec<Value>>, Vec<Usage>)> {
                 {
                     let mut parsed = Usage::default();
                     absorb(&mut parsed, u);
+                    parsed.model = msg.get("model").and_then(Value::as_str).map(str::to_string);
                     usage.push((id.clone(), parsed));
                 }
                 let blocks = msg.get("content").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -126,10 +127,11 @@ pub fn replay_file(path: &Path, cfg: &TransformConfig) -> Result<Option<Report>>
         return Ok(None);
     }
     let write_mult = if usage.iter().any(|u| u.cache_creation_1h > 0) { 2.0 } else { 1.25 };
+    let read = read_price(usage.iter().find_map(|u| u.model.as_deref()).unwrap_or(""));
     let mut report = Report {
         file: path.to_path_buf(),
         requests: usage.len(),
-        actual_input_eq: usage.iter().map(Usage::input_equivalent).sum(),
+        actual_input_eq: usage.iter().map(|u| u.input_equivalent(read)).sum(),
         ..Default::default()
     };
     for seg in segments {
@@ -162,7 +164,7 @@ pub fn replay_file(path: &Path, cfg: &TransformConfig) -> Result<Option<Report>>
             }
             report.bytes_saved += c.saved_bytes;
             // Written to the cache once, then read on every later request.
-            report.saved_input_eq += approx_tokens(c.saved_bytes) * (write_mult + 0.1 * (later - 1) as f64);
+            report.saved_input_eq += approx_tokens(c.saved_bytes) * (write_mult + read * (later - 1) as f64);
         }
     }
     Ok(Some(report))
@@ -201,7 +203,7 @@ mod tests {
         let usage = json!({ "input_tokens": 10, "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 20000, "output_tokens": 50, "cache_creation": { "ephemeral_1h_input_tokens": 1000, "ephemeral_5m_input_tokens": 0 } });
         let lines = vec![
             json!({ "type": "user", "message": { "role": "user", "content": "build it" } }),
-            json!({ "type": "assistant", "message": { "id": "m1", "role": "assistant", "content": [{ "type": "thinking", "thinking": "" }], "usage": usage } }),
+            json!({ "type": "assistant", "message": { "id": "m1", "model": "claude-opus-5-5", "role": "assistant", "content": [{ "type": "thinking", "thinking": "" }], "usage": usage } }),
             json!({ "type": "assistant", "message": { "id": "m1", "role": "assistant", "content": [{ "type": "tool_use", "id": "t1", "name": "Bash", "input": { "command": "cargo build" } }], "usage": usage } }),
             json!({ "type": "user", "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": log }] } }),
             json!({ "type": "assistant", "isSidechain": true, "message": { "id": "x", "role": "assistant", "content": [], "usage": usage } }),
@@ -216,8 +218,8 @@ mod tests {
         assert_eq!(r.requests, 3);
         assert_eq!(r.compressed, 1);
         assert!(r.bytes_saved > log.len() / 2);
-        // Written once (2x) then read once (0.1x): two later requests.
-        let expected = approx_tokens(r.bytes_saved) * 2.1;
+        // Written once (2x) then read once (0.05x on Opus 5.5): two later requests.
+        let expected = approx_tokens(r.bytes_saved) * 2.05;
         assert!((r.saved_input_eq - expected).abs() < 1e-6);
         assert!(r.savings_pct().unwrap() > 0.0);
     }

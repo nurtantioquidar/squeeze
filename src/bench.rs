@@ -13,7 +13,8 @@
 //! - squeeze arms use only Claude Code's documented extension points: a
 //!   PostToolUse hook passed with `--settings` and an MCP server passed with
 //!   `--mcp-config`. With subscription auth no proxy is involved anywhere.
-//! - The `squeeze-proxy` arm sees API traffic, so it requires an API key.
+//! - The proxied arms (`squeeze-proxy`, `squeeze-proxy-cm`) see API traffic,
+//!   so they require an API key.
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -42,7 +43,28 @@ pub struct Defaults {
     /// Idle time between tickets. Above the prompt-cache TTL it reproduces a
     /// "workday" regime where caches expire between tickets.
     pub pause_between_tickets_secs: Option<u64>,
+    /// Also pause that long before every n-th user message of a session (the
+    /// opening one is the first), as SessionBench did for Fermat with n = 3. A
+    /// ticket's opening message waits once, with the ticket pause.
+    pub pause_every_n_turns: Option<u64>,
     pub allowed_tools: Option<Vec<String>>,
+}
+
+impl Defaults {
+    /// Refuse settings that would silently do nothing.
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.pause_every_n_turns.is_some_and(|n| n > 0) && self.pause_between_tickets_secs.unwrap_or(0) == 0 {
+            bail!("pause_every_n_turns needs pause_between_tickets_secs, which sets how long each pause is");
+        }
+        Ok(())
+    }
+
+    /// The pause before the session's `turn`-th user message (1-based) when
+    /// it continues a ticket: a review round's reply to the agent.
+    pub(crate) fn turn_pause(&self, turn: u64) -> Option<Duration> {
+        let (n, secs) = (self.pause_every_n_turns?, self.pause_between_tickets_secs?);
+        (n > 0 && secs > 0 && turn > 1 && turn.is_multiple_of(n)).then(|| Duration::from_secs(secs))
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -89,6 +111,7 @@ pub fn load(path: &Path) -> Result<Plan> {
     if file.bundles.is_empty() || file.bundles.iter().any(|b| b.tickets.is_empty()) {
         bail!("{} needs at least one [[bundle]] with at least one [[bundle.ticket]]", path.display());
     }
+    file.defaults.check().with_context(|| format!("in {}", path.display()))?;
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     let dir = dir.canonicalize().unwrap_or(dir);
     Ok(Plan { dir, defaults: file.defaults, bundles: file.bundles })
@@ -106,6 +129,9 @@ pub enum Arm {
     SqueezeMcp,
     /// Proxy compression + MCP tools (API key only).
     SqueezeProxy,
+    /// squeeze-proxy plus server-side context editing at cold-cache moments
+    /// (`squeeze proxy --context-edits cold`, API key only).
+    SqueezeProxyCm,
     /// Hook compression + MCP tools that replace Claude Code's file tools
     /// (Read/Edit/Write/Grep/Glob turned off), working guidance, and unused
     /// built-in tools trimmed (`squeeze run --replace-file-tools --trim-tools`).
@@ -132,6 +158,7 @@ impl Arm {
             Arm::SqueezeHook => "squeeze-hook",
             Arm::SqueezeMcp => "squeeze-mcp",
             Arm::SqueezeProxy => "squeeze-proxy",
+            Arm::SqueezeProxyCm => "squeeze-proxy-cm",
             Arm::SqueezeFull => "squeeze-full",
             Arm::SqueezeScout => "squeeze-scout",
             Arm::SqueezeCompact => "squeeze-compact",
@@ -143,10 +170,23 @@ impl Arm {
             Arm::Squeeze
                 | Arm::SqueezeMcp
                 | Arm::SqueezeProxy
+                | Arm::SqueezeProxyCm
                 | Arm::SqueezeFull
                 | Arm::SqueezeScout
                 | Arm::SqueezeCompact
         )
+    }
+    /// The `squeeze proxy` flags of an arm that runs through the proxy.
+    pub fn proxy_args(self) -> Option<&'static [&'static str]> {
+        match self {
+            Arm::SqueezeProxy => Some(&[]),
+            Arm::SqueezeProxyCm => Some(&["--context-edits", "cold"]),
+            _ => None,
+        }
+    }
+    /// Runs through the proxy, so it needs an API key.
+    pub fn is_proxied(self) -> bool {
+        self.proxy_args().is_some()
     }
     pub(crate) fn uses_hook(self) -> bool {
         matches!(self, Arm::Squeeze | Arm::SqueezeHook | Arm::SqueezeFull | Arm::SqueezeScout | Arm::SqueezeCompact)
@@ -212,12 +252,13 @@ impl std::str::FromStr for Arm {
             "squeeze-hook" => Arm::SqueezeHook,
             "squeeze-mcp" => Arm::SqueezeMcp,
             "squeeze-proxy" => Arm::SqueezeProxy,
+            "squeeze-proxy-cm" => Arm::SqueezeProxyCm,
             "squeeze-full" => Arm::SqueezeFull,
             "squeeze-scout" => Arm::SqueezeScout,
             "squeeze-compact" => Arm::SqueezeCompact,
             other => {
                 bail!(
-                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-compact, squeeze-hook, squeeze-mcp, squeeze-proxy)"
+                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-compact, squeeze-hook, squeeze-mcp, squeeze-proxy, squeeze-proxy-cm)"
                 )
             }
         })
@@ -239,7 +280,8 @@ pub struct Context {
     pub exe: PathBuf,
     pub store_root: PathBuf,
     pub auth: Auth,
-    pub proxy_url: Option<String>,
+    /// The proxy each proxied arm talks to.
+    pub proxy_urls: BTreeMap<Arm, String>,
     pub model_override: Option<String>,
     pub include_user_settings: bool,
     pub keep_dirs: bool,
@@ -631,8 +673,8 @@ pub async fn run_session(r: Run<'_>) -> Result<SessionResult> {
 
 async fn session_inner(r: &Run<'_>, model: Option<&str>, res: &mut SessionResult) -> Result<()> {
     let (d, ctx, bundle) = (&r.plan.defaults, r.ctx, r.bundle);
-    if r.arm == Arm::SqueezeProxy && (ctx.auth != Auth::ApiKey || ctx.proxy_url.is_none()) {
-        bail!("the squeeze-proxy arm needs --auth api-key");
+    if r.arm.is_proxied() && (ctx.auth != Auth::ApiKey || !ctx.proxy_urls.contains_key(&r.arm)) {
+        bail!("the {} arm needs --auth api-key", r.arm.name());
     }
     let tmp = tempfile::Builder::new().prefix("squeeze-bench-").tempdir()?;
     let work = tmp.path().join("repo");
@@ -674,7 +716,7 @@ async fn session_inner(r: &Run<'_>, model: Option<&str>, res: &mut SessionResult
     } else {
         None
     };
-    let base_url = (r.arm == Arm::SqueezeProxy).then(|| ctx.proxy_url.clone()).flatten();
+    let base_url = ctx.proxy_urls.get(&r.arm).cloned();
     let session_id = uuid_v4(&format!("{}/{}/{}", bundle.name, r.arm.name(), r.repeat));
     res.session_id = session_id.clone();
     let mut started = false;
@@ -729,6 +771,11 @@ async fn session_inner(r: &Run<'_>, model: Option<&str>, res: &mut SessionResult
         let mut message = ticket.prompt.clone();
         let (mut passed, mut test_out) = (None, String::new());
         loop {
+            if tr.pushbacks > 0
+                && let Some(p) = d.turn_pause(res.agent.invocations + 1)
+            {
+                tokio::time::sleep(p).await;
+            }
             let result =
                 claude(ctx, &work, &agent_args(started), &message, timeout, base_url.as_deref(), &r.arm.env()).await?;
             started = true;
@@ -1051,7 +1098,7 @@ mod tests {
             exe: PathBuf::from("squeeze"),
             store_root: dir.join("store"),
             auth: Auth::ApiKey,
-            proxy_url: None,
+            proxy_urls: BTreeMap::new(),
             model_override: None,
             include_user_settings: false,
             keep_dirs: false,
@@ -1238,5 +1285,24 @@ mod tests {
         assert_eq!(parse_json_reply("Sure:\n{\"approve\": false, \"message\": \"x\"}\n").unwrap()["approve"], false);
         assert_eq!(uuid_v4("a").chars().nth(14), Some('4'));
         assert_eq!("squeeze-hook".parse::<Arm>().unwrap(), Arm::SqueezeHook);
+        let cm: Arm = "squeeze-proxy-cm".parse().unwrap();
+        assert_eq!((cm.name(), cm.proxy_args()), ("squeeze-proxy-cm", Some(&["--context-edits", "cold"][..])));
+        assert!(cm.is_proxied() && cm.uses_mcp() && !cm.uses_hook());
+        assert!(!Arm::Squeeze.is_proxied());
+    }
+
+    #[test]
+    fn pauses_every_nth_user_message_as_sessionbench_did() {
+        let d: Defaults = toml::from_str("pause_between_tickets_secs = 330\npause_every_n_turns = 3").unwrap();
+        d.check().unwrap();
+        let paused: Vec<u64> = (1..=10).filter(|t| d.turn_pause(*t).is_some()).collect();
+        assert_eq!(paused, [3, 6, 9]);
+        assert_eq!(d.turn_pause(3), Some(Duration::from_secs(330)));
+        let every =
+            Defaults { pause_every_n_turns: Some(1), pause_between_tickets_secs: Some(5), ..Default::default() };
+        assert_eq!(every.turn_pause(1), None, "nothing to wait for before the first message");
+        assert_eq!(Defaults::default().turn_pause(3), None);
+        let no_length = Defaults { pause_every_n_turns: Some(3), ..Default::default() };
+        assert!(no_length.check().is_err());
     }
 }

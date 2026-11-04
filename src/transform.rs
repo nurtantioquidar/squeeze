@@ -15,9 +15,10 @@
 //! It also means the proxy needs no per-conversation state to stay consistent.
 
 use crate::compress::{self, BashKind};
+use crate::ctxmgmt::{self, KeepWindow};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Stores originals of lossily compressed outputs so they can be expanded later.
 pub trait BlobSink {
@@ -59,6 +60,13 @@ pub struct TransformConfig {
     pub minify_json: bool,
     pub expand_hint: ExpandHint,
     pub prune: PruneConfig,
+    /// With server-side context editing (`--context-edits`), the window of
+    /// recent clearable tool uses an advance keeps. A rewrite then never
+    /// points at an older result the server may have cleared: Claude Code's
+    /// "file unchanged" Read results whose earlier Read falls outside it are
+    /// refilled (see `plan_refills`), and an output is deduplicated only
+    /// against a copy inside it.
+    pub ctx_window: Option<KeepWindow>,
 }
 
 impl Default for TransformConfig {
@@ -71,6 +79,7 @@ impl Default for TransformConfig {
             minify_json: true,
             expand_hint: ExpandHint::Cli,
             prune: PruneConfig::default(),
+            ctx_window: None,
         }
     }
 }
@@ -81,6 +90,8 @@ pub enum ChangeKind {
     Compressed,
     Deduped,
     Pruned,
+    /// An unchanged-file stand-in given its content back (costs `added_bytes`).
+    Refilled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +99,8 @@ pub struct Change {
     pub tool_use_id: String,
     pub kind: ChangeKind,
     pub saved_bytes: usize,
+    /// Bytes the rewrite added (a refill).
+    pub added_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -96,6 +109,7 @@ pub struct TransformStats {
     pub compressed: usize,
     pub deduped: usize,
     pub pruned: usize,
+    pub refilled: usize,
     pub bytes_before: usize,
     pub bytes_after: usize,
     #[serde(skip)]
@@ -112,10 +126,16 @@ impl TransformStats {
             ChangeKind::Compressed => self.compressed += 1,
             ChangeKind::Deduped => self.deduped += 1,
             ChangeKind::Pruned => self.pruned += 1,
+            ChangeKind::Refilled => self.refilled += 1,
         }
         self.bytes_before += before;
         self.bytes_after += after;
-        self.changes.push(Change { tool_use_id: id.to_string(), kind, saved_bytes: before.saturating_sub(after) });
+        self.changes.push(Change {
+            tool_use_id: id.to_string(),
+            kind,
+            saved_bytes: before.saturating_sub(after),
+            added_bytes: after.saturating_sub(before),
+        });
     }
 }
 
@@ -151,8 +171,20 @@ pub fn transform(
         Some(b) if cfg.prune.enabled => plan_prune(messages, &uses, &results, b, &cfg.prune),
         _ => HashMap::new(),
     };
+    let positions = cfg.ctx_window.map(|_| ctxmgmt::use_positions(messages)).unwrap_or_default();
+    let refills = cfg.ctx_window.map(|w| plan_refills(messages, &uses, &results, &positions, w)).unwrap_or_default();
 
-    let mut seen: HashSet<String> = HashSet::new();
+    // Dedup key -> clearable-use position of the latest copy sent in full.
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let pos = |id: &str| positions.get(id).map_or(0, |p| p.pos);
+    // With context editing, a copy `K` or more clearable uses back may be
+    // cleared by the time the agent looks (see `plan_refills`): the output
+    // then goes in full and becomes the latest copy. Tools the server never
+    // clears have no position, and always deduplicate.
+    let in_reach = |id: &str, latest: usize| {
+        let at = cfg.ctx_window.zip(positions.get(id));
+        at.is_none_or(|(w, p)| p.pos.saturating_sub(latest) < w.k(p.since_prev_human))
+    };
     for (ri, loc) in results.iter().enumerate() {
         stats.tool_results += 1;
         let Some(block) =
@@ -165,8 +197,26 @@ pub fn transform(
         }
         let Some(tu) = uses.get(&loc.id) else { continue };
         let before = text_len(block);
+        if let Some(text) = refills.get(&ri) {
+            // A copy of its own: never deduplicated against the Read it repeats.
+            if set_text(block, text) {
+                stats.record(&loc.id, ChangeKind::Refilled, before, text_len(block));
+            }
+            continue;
+        }
+        let dedups = cfg.dedup && before >= cfg.min_bytes && !tu.name.starts_with(SQUEEZE_TOOL_PREFIX);
 
         if let Some(action) = prune.get(&ri) {
+            // A later identical call stays a reference to an older output that
+            // was cut to its head and tail (the rest is one expand away), so
+            // pruning doesn't resend it in full. A stale Read is different: the
+            // later Read is now where its content lives.
+            if dedups
+                && matches!(action, PruneAction::OldOutput)
+                && let Some(key) = dedup_key(tu, block)
+            {
+                seen.insert(key, pos(&loc.id));
+            }
             if apply_prune(block, action, cfg, sink) {
                 stats.record(&loc.id, ChangeKind::Pruned, before, text_len(block));
             }
@@ -175,17 +225,14 @@ pub fn transform(
         if before < cfg.min_bytes {
             continue;
         }
-        if cfg.dedup
-            && !tu.name.starts_with(SQUEEZE_TOOL_PREFIX)
-            && let Some(key) = dedup_key(tu, block)
-        {
-            if seen.contains(&key) {
+        if dedups && let Some(key) = dedup_key(tu, block) {
+            if seen.get(&key).is_some_and(|&latest| in_reach(&loc.id, latest)) {
                 if set_text(block, &dedup_stub(tu)) {
                     stats.record(&loc.id, ChangeKind::Deduped, before, text_len(block));
                 }
                 continue;
             }
-            seen.insert(key);
+            seen.insert(key, pos(&loc.id));
         }
         if compress_result(block, tu, cfg, sink) {
             stats.record(&loc.id, ChangeKind::Compressed, before, text_len(block));
@@ -234,7 +281,7 @@ fn locate_results(messages: &[Value]) -> Vec<ResultLoc> {
 }
 
 /// Total length of the text parts of a tool_result.
-fn text_len(block: &Value) -> usize {
+pub(crate) fn text_len(block: &Value) -> usize {
     match block.get("content") {
         Some(Value::String(s)) => s.len(),
         Some(Value::Array(items)) => items
@@ -372,6 +419,58 @@ fn compress_result(block: &mut Value, tu: &ToolUse, cfg: &TransformConfig, sink:
     changed
 }
 
+/// How Claude Code answers a Read of a file it has already shown, unchanged since.
+const UNCHANGED_READ: &[&str] = &[
+    "File unchanged since last read.",
+    "Wasted call \u{2014} file unchanged since your last Read.",
+    "<system-reminder>This file is already in your context",
+];
+
+/// With server-side context editing, the earlier Read that an unchanged-file
+/// stand-in points to may have been cleared by the time the agent looks. A
+/// stand-in whose latest copy of that content (same path, offset and limit)
+/// is `K` or more clearable tool uses back, outside the window an advance
+/// keeps, gets the earlier Read's text instead. The cut an advance makes (all
+/// but the newest `K`) only moves forward as the history grows, so a copy
+/// fewer than `K` uses back is still there when the stand-in is first sent.
+/// Each choice depends only on the messages up to the stand-in, so it's the
+/// same on every request; the server's cleared set can't be consulted, since
+/// it moves.
+fn plan_refills(
+    messages: &[Value],
+    uses: &HashMap<String, ToolUse>,
+    results: &[ResultLoc],
+    positions: &HashMap<String, ctxmgmt::UsePos>,
+    window: KeepWindow,
+) -> HashMap<usize, String> {
+    let block = |loc: &ResultLoc| &messages[loc.msg]["content"][loc.block];
+    // Per path and range: where the latest copy of its content is, and the Read that returned it.
+    let mut copies: HashMap<String, (usize, &ResultLoc)> = HashMap::new();
+    let mut plan = HashMap::new();
+    for (ri, loc) in results.iter().enumerate() {
+        let (Some(tu), Some(at)) = (uses.get(&loc.id), positions.get(&loc.id)) else { continue };
+        if tu.name != "Read" || block(loc).get("is_error").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let first_text = match block(loc).get("content") {
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(Value::Array(items)) => items.first().and_then(|b| b.get("text")).and_then(Value::as_str),
+            _ => None,
+        };
+        let key = format!("{}\u{0}{}\u{0}{}", tu.input["file_path"], tu.input["offset"], tu.input["limit"]);
+        if !first_text.is_some_and(|t| UNCHANGED_READ.iter().any(|s| t.starts_with(s))) {
+            copies.insert(key, (at.pos, loc));
+        } else if let Some((latest, source)) = copies.get_mut(&key)
+            && at.pos.saturating_sub(*latest) >= window.k(at.since_prev_human)
+            && let Some(content) = full_text(block(source))
+        {
+            plan.insert(ri, content);
+            *latest = at.pos;
+        }
+    }
+    plan
+}
+
 #[derive(Debug, Clone)]
 enum PruneAction {
     StaleRead { path: String, reason: &'static str },
@@ -486,7 +585,8 @@ fn apply_prune(block: &mut Value, action: &PruneAction, cfg: &TransformConfig, s
     }
 }
 
-/// Longest prompt-cache TTL requested anywhere in the body, in seconds.
+/// Longest prompt-cache TTL requested anywhere in the body, in seconds. It
+/// sets the price of a cache write, not when the conversation goes cold.
 pub fn max_cache_ttl_secs(body: &Value) -> u64 {
     fn walk(v: &Value, best: &mut u64) {
         match v {
@@ -510,6 +610,27 @@ pub fn max_cache_ttl_secs(body: &Value) -> u64 {
     best
 }
 
+/// TTL of the last `cache_control` marker in `messages`, in seconds (300 when
+/// it has none). That marker caches the conversation itself, so this is how
+/// long the history stays cached between requests; a 1-hour `system` marker
+/// keeps only the shared prefix warm.
+pub fn message_cache_ttl_secs(body: &Value) -> u64 {
+    fn marker(b: &Value) -> Option<&Value> {
+        b.get("cache_control").filter(|c| c.is_object())
+    }
+    // Markers sit on content blocks, or on the text inside a tool_result.
+    let last = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .filter_map(|m| m.get("content").and_then(Value::as_array))
+        .flat_map(|blocks| blocks.iter().rev())
+        .find_map(|b| marker(b).or_else(|| b.get("content")?.as_array()?.iter().rev().find_map(marker)));
+    last.and_then(|cc| cc.get("ttl").and_then(Value::as_str).and_then(parse_ttl)).unwrap_or(300)
+}
+
 fn parse_ttl(s: &str) -> Option<u64> {
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
     let n: u64 = num.parse().ok()?;
@@ -519,6 +640,21 @@ fn parse_ttl(s: &str) -> Option<u64> {
         "h" => n * 3600,
         _ => return None,
     })
+}
+
+/// Id of the conversation's first tool call. It never changes once made, so
+/// it names the conversation (see `proxy`).
+pub fn first_tool_use_id(body: &Value) -> Option<String> {
+    let messages = body.get("messages")?.as_array()?;
+    let id = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|m| m.get("content").and_then(Value::as_array))
+        .flatten()
+        .find(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))?
+        .get("id")?
+        .as_str()?;
+    Some(id.to_string())
 }
 
 /// Id of the last tool_result in the conversation (used as a prune boundary).
@@ -723,9 +859,190 @@ mod tests {
     }
 
     #[test]
+    fn pruning_an_old_output_keeps_later_copies_deduplicated() {
+        let msgs = vec![
+            json!({ "role": "user", "content": "go" }),
+            tool_use("b1", "Bash", json!({ "command": "cargo build" })),
+            tool_result("b1", json!(build_log())),
+            tool_use("x", "Bash", json!({ "command": "ls" })),
+            tool_result("x", json!("a\nb")),
+            tool_use("b2", "Bash", json!({ "command": "cargo build" })),
+            tool_result("b2", json!(build_log())),
+        ];
+        let (warm, _) = run(&msgs, &prune_cfg(), None);
+        let (cold, stats) = run(&msgs, &prune_cfg(), Some("b2"));
+        assert!(result_text(&cold[2]).contains("older output pruned"));
+        assert!(result_text(&cold[6]).contains("identical to the output of the earlier Bash call"));
+        assert_eq!(cold[6], warm[6], "the later copy is sent as before, not in full");
+        assert_eq!((stats.pruned, stats.deduped), (1, 1));
+    }
+
+    #[test]
+    fn a_stale_read_hands_its_content_to_the_later_read() {
+        let msgs = vec![
+            json!({ "role": "user", "content": "go" }),
+            tool_use("r1", "Read", json!({ "file_path": "/w/a.rs" })),
+            tool_result("r1", json!(file_body("a"))),
+            tool_use("r2", "Read", json!({ "file_path": "/w/a.rs" })),
+            tool_result("r2", json!(file_body("a"))),
+        ];
+        let (cold, _) = run(&msgs, &prune_cfg(), Some("r2"));
+        assert!(result_text(&cold[2]).contains("pruned because the file was read again"));
+        assert_eq!(result_text(&cold[4]), file_body("a"), "the content must still be somewhere");
+    }
+
+    const UNCHANGED: &str = "File unchanged since last read. The content from the earlier Read tool_result in this \
+                             conversation is still current \u{2014} refer to that instead of re-reading.";
+    const WASTED: &str =
+        "Wasted call \u{2014} file unchanged since your last Read. Refer to that earlier tool_result instead.";
+
+    /// Read a.rs, again at once, two Bash calls, two more unchanged Reads, two
+    /// more Bash calls and an unchanged Read of another range.
+    fn reread_conversation() -> Vec<Value> {
+        vec![
+            json!({ "role": "user", "content": "go" }),
+            tool_use("r1", "Read", json!({ "file_path": "/w/a.rs" })),
+            tool_result("r1", json!(file_body("a"))),
+            tool_use("r2", "Read", json!({ "file_path": "/w/a.rs" })),
+            tool_result("r2", json!(UNCHANGED)),
+            tool_use("b1", "Bash", json!({ "command": "ls" })),
+            tool_result("b1", json!("x")),
+            tool_use("b2", "Bash", json!({ "command": "pwd" })),
+            tool_result("b2", json!("y")),
+            tool_use("r3", "Read", json!({ "file_path": "/w/a.rs" })),
+            tool_result("r3", json!(WASTED)),
+            tool_use("r4", "Read", json!({ "file_path": "/w/a.rs" })),
+            tool_result("r4", json!(UNCHANGED)),
+            tool_use("b3", "Bash", json!({ "command": "date" })),
+            tool_result("b3", json!("z")),
+            tool_use("b4", "Bash", json!({ "command": "id" })),
+            tool_result("b4", json!("w")),
+            tool_use("r5", "Read", json!({ "file_path": "/w/a.rs", "offset": 10 })),
+            tool_result("r5", json!(UNCHANGED)),
+        ]
+    }
+
+    fn refill_cfg() -> TransformConfig {
+        TransformConfig { ctx_window: Some(KeepWindow { min: 3, max: 3 }), ..Default::default() }
+    }
+
+    #[test]
+    fn refills_unchanged_reads_whose_copy_is_outside_the_window() {
+        let (out, stats) = run(&reread_conversation(), &refill_cfg(), None);
+        assert_eq!(result_text(&out[4]), UNCHANGED, "one use back: inside the window");
+        assert_eq!(result_text(&out[10]), file_body("a"), "four uses back: refilled, and not deduplicated");
+        assert_eq!(result_text(&out[12]), UNCHANGED, "the refill is the latest copy now");
+        assert_eq!(result_text(&out[18]), UNCHANGED, "another range has no earlier copy");
+        assert_eq!((stats.refilled, stats.deduped), (1, 0));
+        let (out, _) = run(&reread_conversation(), &TransformConfig::default(), None);
+        assert_eq!(out, reread_conversation(), "only with context editing");
+    }
+
+    #[test]
+    fn refills_are_prefix_stable() {
+        let full = reread_conversation();
+        let (full_out, _) = run(&full, &refill_cfg(), None);
+        for k in 1..=full.len() {
+            let (prefix_out, _) = run(&full[..k], &refill_cfg(), None);
+            assert_eq!(prefix_out[..], full_out[..k], "prefix of length {k} diverged");
+        }
+    }
+
+    /// `cargo build` run three times and a foreign MCP query twice: the second
+    /// build four clearable uses after the first (TodoWrite isn't one), the
+    /// third right after the second.
+    fn rebuild_conversation() -> Vec<Value> {
+        let rows =
+            json!({ "rows": (0..80).map(|i| json!({ "id": i, "name": format!("row{i}") })).collect::<Vec<_>>() });
+        let rows = serde_json::to_string_pretty(&rows).unwrap();
+        vec![
+            json!({ "role": "user", "content": "go" }),
+            tool_use("b1", "Bash", json!({ "command": "cargo build" })),
+            tool_result("b1", json!(build_log())),
+            tool_use("q1", "mcp__other__query", json!({ "q": "x" })),
+            tool_result("q1", json!(rows)),
+            tool_use("x1", "Bash", json!({ "command": "ls" })),
+            tool_result("x1", json!("a")),
+            tool_use("x2", "Read", json!({ "file_path": "/w/a.rs" })),
+            tool_result("x2", json!("b")),
+            tool_use("t", "TodoWrite", json!({ "todos": [] })),
+            tool_result("t", json!("ok")),
+            tool_use("x3", "Grep", json!({ "pattern": "x" })),
+            tool_result("x3", json!("c")),
+            tool_use("b2", "Bash", json!({ "command": "cargo build" })),
+            tool_result("b2", json!(build_log())),
+            tool_use("b3", "Bash", json!({ "command": "cargo build" })),
+            tool_result("b3", json!(build_log())),
+            tool_use("q2", "mcp__other__query", json!({ "q": "x" })),
+            tool_result("q2", json!(rows)),
+        ]
+    }
+
+    #[test]
+    fn with_context_edits_dedup_points_only_at_copies_inside_the_window() {
+        let stub = "this output is identical to the output of";
+        let (out, stats) = run(&rebuild_conversation(), &refill_cfg(), None);
+        assert!(!result_text(&out[14]).contains(stub), "four uses back: the server may have cleared it");
+        assert!(result_text(&out[14]).contains("error[E0425]"));
+        assert!(result_text(&out[16]).contains(stub), "one use after the copy sent in full");
+        assert!(result_text(&out[18]).contains(stub), "an excluded tool's output is never cleared");
+        assert_eq!(stats.deduped, 2);
+        let (out, stats) = run(&rebuild_conversation(), &TransformConfig::default(), None);
+        assert!(result_text(&out[14]).contains(stub), "without context editing, as before");
+        assert_eq!(stats.deduped, 3);
+        let full = rebuild_conversation();
+        let (full_out, _) = run(&full, &refill_cfg(), None);
+        for k in 1..=full.len() {
+            assert_eq!(run(&full[..k], &refill_cfg(), None).0[..], full_out[..k], "prefix of length {k} diverged");
+        }
+    }
+
+    #[test]
+    fn a_refill_records_what_it_adds() {
+        let (_, stats) = run(&reread_conversation(), &refill_cfg(), None);
+        let c = stats.changes.iter().find(|c| c.kind == ChangeKind::Refilled).unwrap();
+        assert_eq!((c.saved_bytes, c.added_bytes), (0, file_body("a").len() - WASTED.len()));
+    }
+
+    #[test]
     fn parses_cache_ttl() {
         let body = json!({ "system": [{ "type": "text", "text": "s", "cache_control": { "type": "ephemeral", "ttl": "1h" } }], "messages": [] });
         assert_eq!(max_cache_ttl_secs(&body), 3600);
         assert_eq!(max_cache_ttl_secs(&json!({ "messages": [] })), 300);
+    }
+
+    #[test]
+    fn message_ttl_comes_from_the_last_message_marker() {
+        let one_hour = json!({ "type": "ephemeral", "ttl": "1h" });
+        let mut body = json!({
+            "system": [{ "type": "text", "text": "s", "cache_control": one_hour }],
+            "messages": [
+                { "role": "user", "content": [{ "type": "text", "text": "a", "cache_control": one_hour }] },
+                { "role": "assistant", "content": [{ "type": "tool_use", "id": "t", "name": "X", "input": { "cache_control": one_hour } }] },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "t", "content": "x", "cache_control": { "type": "ephemeral" } },
+                    { "type": "text", "text": "more" }
+                ] }
+            ]
+        });
+        // A 1-hour system marker keeps only the prefix; the history lives 5 minutes.
+        assert_eq!(max_cache_ttl_secs(&body), 3600);
+        assert_eq!(message_cache_ttl_secs(&body), 300);
+        body["messages"][2]["content"][0] = json!({ "type": "tool_result", "tool_use_id": "t",
+            "content": [{ "type": "text", "text": "x", "cache_control": one_hour }] });
+        assert_eq!(message_cache_ttl_secs(&body), 3600);
+        assert_eq!(message_cache_ttl_secs(&json!({ "messages": [{ "role": "user", "content": "hi" }] })), 300);
+    }
+
+    #[test]
+    fn first_tool_use_id_is_the_oldest_call() {
+        let mut msgs = conversation();
+        msgs[3] = json!({ "role": "assistant", "content": [
+            { "type": "thinking", "thinking": "", "signature": "s" },
+            { "type": "tool_use", "id": "t2", "name": "Read", "input": {} }
+        ] });
+        assert_eq!(first_tool_use_id(&json!({ "messages": msgs })).as_deref(), Some("t1"));
+        assert_eq!(first_tool_use_id(&json!({ "messages": msgs[3..] })).as_deref(), Some("t2"));
+        assert_eq!(first_tool_use_id(&json!({ "messages": [{ "role": "user", "content": "hi" }] })), None);
     }
 }

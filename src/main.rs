@@ -3,6 +3,8 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 use squeeze::auth::{self, Credential};
 use squeeze::bench::{self, Arm};
+use squeeze::cachesim::{self, Regime, SimConfig};
+use squeeze::ctxmgmt::{ContextEdits, CtxConfig, KeepWindow};
 use squeeze::mcp;
 use squeeze::proxy::{DEFAULT_UPSTREAM, Proxy, ProxyConfig, Totals};
 use squeeze::replay;
@@ -73,21 +75,78 @@ struct CompressFlags {
     #[arg(long)]
     no_dedup: bool,
     /// Experimental: prune stale context, only when the prompt cache has already expired
-    #[arg(long)]
+    #[arg(
+        long,
+        conflicts_with_all = ["context_edits", "keep_tool_uses", "keep_tool_uses_max", "clear_tool_inputs", "clear_thinking"]
+    )]
     prune_cold_cache: bool,
+    /// Experimental, proxy only: have the API clear old tool results and thinking
+    /// (server-side context editing). `cold` moves what's cleared forward only when
+    /// the prompt cache has already expired, so the cache keeps hitting in between.
+    /// `off` sends Claude Code's own setting unchanged
+    #[arg(long, value_name = "off|cold", default_value = "off", conflicts_with = "no_compress")]
+    context_edits: ContextEdits,
+    /// With --context-edits: keep at least this many recent clearable tool uses
+    #[arg(long, value_name = "N", default_value_t = KeepWindow::default().min)]
+    keep_tool_uses: usize,
+    /// With --context-edits: keep the tool uses since the start of the previous
+    /// human turn, up to this many
+    #[arg(long, value_name = "N", default_value_t = KeepWindow::default().max)]
+    keep_tool_uses_max: usize,
+    /// With --context-edits: clear tool inputs (the agent's older Edit and Write text) too
+    #[arg(long)]
+    clear_tool_inputs: bool,
+    /// With --context-edits: also clear thinking from before the latest human prompt
+    #[arg(long, value_name = "BOOL", default_value_t = true, action = clap::ArgAction::Set)]
+    clear_thinking: bool,
     /// Upstream API base URL [default: $ANTHROPIC_BASE_URL, else https://api.anthropic.com]
     #[arg(long)]
     upstream: Option<String>,
 }
 
+/// A proxied bench arm's `squeeze proxy` flags, parsed as the command line would.
+#[derive(Parser)]
+struct ArmProxyFlags {
+    #[command(flatten)]
+    compress: CompressFlags,
+}
+
 impl CompressFlags {
-    fn transform(&self, hint: ExpandHint) -> Option<TransformConfig> {
-        if self.no_compress || std::env::var("SQUEEZE_DISABLE").is_ok_and(|v| v == "1") {
-            return None;
+    fn for_arm(arm: Arm, upstream: Option<String>) -> Result<Self> {
+        let args = arm.proxy_args().with_context(|| format!("the {} arm runs without the proxy", arm.name()))?;
+        let mut flags = ArmProxyFlags::try_parse_from(std::iter::once("squeeze").chain(args.iter().copied()))?.compress;
+        flags.upstream = upstream;
+        Ok(flags)
+    }
+
+    /// `SQUEEZE_DISABLE=1` turns every rewrite off.
+    fn disabled(&self) -> bool {
+        self.no_compress || std::env::var("SQUEEZE_DISABLE").is_ok_and(|v| v == "1")
+    }
+
+    fn ctx(&self) -> Result<Option<CtxConfig>> {
+        if self.context_edits == ContextEdits::Off || self.disabled() {
+            return Ok(None);
+        }
+        Ok(Some(CtxConfig {
+            window: KeepWindow::new(self.keep_tool_uses, self.keep_tool_uses_max)?,
+            clear_inputs: self.clear_tool_inputs,
+            clear_thinking: self.clear_thinking,
+        }))
+    }
+
+    fn transform(&self, hint: ExpandHint) -> Result<Option<TransformConfig>> {
+        if self.disabled() {
+            return Ok(None);
         }
         let mut t = TransformConfig { expand_hint: hint, dedup: !self.no_dedup, ..Default::default() };
         t.prune.enabled = self.prune_cold_cache;
-        Some(t)
+        t.ctx_window = self.ctx()?.map(|c| c.window);
+        Ok(Some(t))
+    }
+
+    fn proxy_config(&self, hint: ExpandHint, store: Store) -> Result<ProxyConfig> {
+        Ok(ProxyConfig { upstream: self.upstream(), transform: self.transform(hint)?, store, ctx: self.ctx()? })
     }
 
     fn upstream(&self) -> String {
@@ -178,6 +237,38 @@ struct ReplayArgs {
     /// Try a different minimum output size to touch, in bytes (default 1500)
     #[arg(long)]
     min_bytes: Option<usize>,
+    /// Simulate the prompt cache instead: what `--context-edits cold` would have cost,
+    /// against the same sessions sent unchanged (needs transcripts from Claude Code
+    /// 2.1.317 or later, which log each request)
+    #[arg(long, conflicts_with_all = ["max_lines", "min_bytes"])]
+    cache_sim: bool,
+    /// With --cache-sim: `5m-fermat` (5-minute cache, with a 330 s pause before each new
+    /// ticket and every third human turn, as SessionBench ran Fermat) or `1h` (1-hour
+    /// cache, the recorded timing)
+    #[arg(long, value_name = "5m-fermat|1h", default_value = "5m-fermat", requires = "cache_sim")]
+    regime: Regime,
+    /// With --cache-sim: cache read price as a multiple of base input [default: the
+    /// model's, 0.05 on Opus 5.5 and Sonnet 5.5, else 0.1]
+    #[arg(long, value_name = "X", requires = "cache_sim")]
+    read_price: Option<f64>,
+    /// With --cache-sim: share of each cleared tool result the agent reads back later
+    #[arg(long, value_name = "FRACTION", default_value_t = 0.0, requires = "cache_sim")]
+    reread: f64,
+    /// With --cache-sim: tokens the server leaves in place of a cleared tool result or input
+    #[arg(long, value_name = "TOKENS", default_value_t = 60.0, requires = "cache_sim")]
+    placeholder: f64,
+    /// With --cache-sim: as `squeeze proxy --keep-tool-uses`
+    #[arg(long, value_name = "N", default_value_t = KeepWindow::default().min, requires = "cache_sim")]
+    keep_tool_uses: usize,
+    /// With --cache-sim: as `squeeze proxy --keep-tool-uses-max`
+    #[arg(long, value_name = "N", default_value_t = KeepWindow::default().max, requires = "cache_sim")]
+    keep_tool_uses_max: usize,
+    /// With --cache-sim: as `squeeze proxy --clear-tool-inputs`
+    #[arg(long, requires = "cache_sim")]
+    clear_tool_inputs: bool,
+    /// With --cache-sim: as `squeeze proxy --clear-thinking`
+    #[arg(long, value_name = "BOOL", default_value_t = true, action = clap::ArgAction::Set, requires = "cache_sim")]
+    clear_thinking: bool,
 }
 
 #[derive(Args)]
@@ -191,7 +282,8 @@ struct BenchArgs {
     /// Repeats per bundle and arm (SessionBench used 5)
     #[arg(long, default_value_t = 3)]
     repeats: usize,
-    /// Arms: vanilla, squeeze, squeeze-hook, squeeze-mcp, squeeze-proxy (api-key only)
+    /// Arms: vanilla, squeeze, squeeze-hook, squeeze-mcp, squeeze-proxy and
+    /// squeeze-proxy-cm (api-key only)
     #[arg(long, value_delimiter = ',', default_value = "vanilla,squeeze")]
     arms: Vec<Arm>,
     /// Only these bundles
@@ -229,12 +321,12 @@ struct AtlasArgs {
     /// Skip grading during sessions (10-20 minutes per ticket); grade afterwards with --regrade
     #[arg(long)]
     defer_grading: bool,
-    /// API key for the squeeze-proxy arm's agent: a chmod 600 file holding ANTHROPIC_API_KEY=...
+    /// API key for the proxied arms' agent: a chmod 600 file holding ANTHROPIC_API_KEY=...
     /// Passed to the containers by path, never read. Other arms, the simulated user and the
     /// judge keep --auth, so only the proxied agent's tokens are billed to the key.
     #[arg(long)]
     api_key_env_file: Option<PathBuf>,
-    /// Where the squeeze-proxy arm's proxy forwards to [default: Anthropic's API]
+    /// Where the proxied arms' proxies forward to [default: Anthropic's API]
     #[arg(long)]
     proxy_upstream: Option<String>,
     /// Where the simulated user's opening messages are shared between arms
@@ -290,6 +382,11 @@ struct AtlasArgs {
     /// Extra KEY=VALUE environment for the agent inside the container
     #[arg(long = "agent-env")]
     agent_env: Vec<String>,
+    /// The agent's prompt-cache lifetime: `client` (Claude Code's own: 1 hour on a
+    /// subscription, 5 minutes on an API key) or `1h` (every arm). Compare arms run
+    /// at the same lifetime.
+    #[arg(long, default_value = "client")]
+    cache_ttl: squeeze::atlas::CacheTtl,
     /// Results file (JSON lines); finished sessions are skipped on rerun
     #[arg(long)]
     out: Option<PathBuf>,
@@ -375,6 +472,14 @@ fn print_summary(t: &Totals) {
         ));
     }
     eprintln!("{line}");
+    if t.ctx_advances > 0 || t.refilled > 0 {
+        eprintln!(
+            "squeeze: context editing moved forward {} time(s) and cleared ~{} input tokens across requests; {} unchanged-file Read(s) refilled",
+            t.ctx_advances,
+            human(t.cleared_input_tokens as f64),
+            t.refilled
+        );
+    }
     if t.refused > 0 {
         eprintln!("squeeze: refused {} request(s) that carried subscription credentials; use an API key", t.refused);
     }
@@ -436,17 +541,16 @@ async fn cmd_run(a: RunArgs) -> Result<i32> {
     let started = now_secs();
     let mut args = a.claude_args.clone();
     let mut cmd = tokio::process::Command::new(&a.claude_bin);
+    if !a.proxy && a.compress.context_edits != ContextEdits::Off {
+        bail!("--context-edits works on API requests, so it needs --proxy");
+    }
 
     let proxy = if a.proxy {
         // Proxy mode sees API traffic, so it is limited to API-key credentials.
         preflight(a.api_key_helper)?;
         init_logging(Some(&store.root().join("logs/squeeze.log")), "info");
         let hint = if a.no_mcp { ExpandHint::Cli } else { ExpandHint::Mcp };
-        let proxy = Proxy::new(ProxyConfig {
-            upstream: a.compress.upstream(),
-            transform: a.compress.transform(hint),
-            store: store.clone(),
-        })?;
+        let proxy = Proxy::new(a.compress.proxy_config(hint, store.clone())?)?;
         let addr = proxy.spawn("127.0.0.1:0").await?;
         tracing::info!("proxy on {addr}, upstream {}", a.compress.upstream());
         cmd.env("ANTHROPIC_BASE_URL", format!("http://{addr}"));
@@ -546,11 +650,7 @@ async fn cmd_proxy(a: ProxyArgs) -> Result<()> {
     if !matches!(a.host.as_str(), "127.0.0.1" | "localhost" | "::1") {
         eprintln!("squeeze: warning: listening on {} exposes the proxy to your network", a.host);
     }
-    let proxy = Proxy::new(ProxyConfig {
-        upstream: a.compress.upstream(),
-        transform: a.compress.transform(ExpandHint::Cli),
-        store,
-    })?;
+    let proxy = Proxy::new(a.compress.proxy_config(ExpandHint::Cli, store)?)?;
     let addr = proxy.spawn(&format!("{}:{}", a.host, a.port)).await?;
     eprintln!(
         "squeeze proxy on http://{addr} -> {}\n\n  export ANTHROPIC_BASE_URL=http://{addr}\n\nAPI-key or gateway credentials only; subscription (OAuth) requests are refused. Ctrl-C to stop.",
@@ -642,13 +742,17 @@ fn cmd_stats(limit: usize) -> Result<()> {
 }
 
 fn cmd_replay(a: ReplayArgs) -> Result<()> {
-    let paths = if a.paths.is_empty() { vec![squeeze::util::home_dir().join(".claude/projects")] } else { a.paths };
+    let paths =
+        if a.paths.is_empty() { vec![squeeze::util::home_dir().join(".claude/projects")] } else { a.paths.clone() };
     let files = replay::find_transcripts(&paths);
     if files.is_empty() {
         bail!(
             "no transcripts (*.jsonl) found under {}",
             paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
         );
+    }
+    if a.cache_sim {
+        return cmd_cache_sim(&a, &files);
     }
     let mut cfg = TransformConfig { expand_hint: ExpandHint::Mcp, ..Default::default() };
     if let Some(n) = a.max_lines {
@@ -678,15 +782,7 @@ fn cmd_replay(a: ReplayArgs) -> Result<()> {
         "session (largest first)", "requests", "outputs", "rewritten", "bytes saved", "est. saving"
     );
     for r in reports.iter().take(a.limit) {
-        let name = r
-            .file
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|p| p.to_string_lossy().trim_start_matches('-').to_string())
-            .unwrap_or_default();
-        let sess =
-            r.file.file_stem().map(|s| s.to_string_lossy().chars().take(8).collect::<String>()).unwrap_or_default();
-        let label = squeeze::util::truncate_chars(&format!("{sess} {name}"), 43);
+        let label = session_label(&r.file);
         let pct = r.savings_pct().map_or("-".into(), |p| format!("{p:.1}%"));
         println!(
             "{label:<44} {:>8} {:>8} {:>10} {:>11} {:>10}",
@@ -713,6 +809,105 @@ fn cmd_replay(a: ReplayArgs) -> Result<()> {
     Ok(())
 }
 
+/// A transcript's session id prefix and project.
+fn session_label(file: &Path) -> String {
+    let name = file
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|p| p.to_string_lossy().trim_start_matches('-').to_string())
+        .unwrap_or_default();
+    let sess = file.file_stem().map(|s| s.to_string_lossy().chars().take(8).collect::<String>()).unwrap_or_default();
+    squeeze::util::truncate_chars(&format!("{sess} {name}"), 43)
+}
+
+fn cmd_cache_sim(a: &ReplayArgs, files: &[PathBuf]) -> Result<()> {
+    if !(0.0..=1.0).contains(&a.reread) {
+        bail!("--reread is a fraction from 0 to 1");
+    }
+    if a.read_price.is_some_and(|r| !(r > 0.0 && r <= 1.0)) || !(0.0..).contains(&a.placeholder) {
+        bail!("--read-price must be above 0 and at most 1, and --placeholder at least 0");
+    }
+    let cfg = SimConfig {
+        regime: a.regime,
+        read_price: a.read_price,
+        reread: a.reread,
+        placeholder: a.placeholder,
+        ctx: CtxConfig {
+            window: KeepWindow::new(a.keep_tool_uses, a.keep_tool_uses_max)?,
+            clear_inputs: a.clear_tool_inputs,
+            clear_thinking: a.clear_thinking,
+        },
+    };
+    let sim = cachesim::simulate_files(files, &cfg)?;
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&sim)?);
+        return Ok(());
+    }
+    let regime = match a.regime {
+        Regime::FiveMinFermat => "5m-fermat: 5-minute cache, 330 s pauses",
+        Regime::OneHour => "1h: 1-hour cache, recorded timing",
+    };
+    println!(
+        "Cache simulation ({regime}). --context-edits cold keeping {}-{} tool uses, inputs {}, thinking {};\n\
+         placeholder {} tokens, {:.0}% of each cleared result read back.",
+        a.keep_tool_uses,
+        a.keep_tool_uses_max,
+        if a.clear_tool_inputs { "cleared" } else { "kept" },
+        if a.clear_thinking { "cleared" } else { "kept" },
+        a.placeholder,
+        100.0 * a.reread
+    );
+    let c = &sim.calibration;
+    println!(
+        "Token fit per 4 bytes: text {:.3}, tool input {:.3}, tool result {:.3}, other {:.3}, +{:.1} per block\n\
+         (thinking billed as recorded; fitted weight {:.3}).\n",
+        c.text, c.input, c.result, c.other, c.per_block, c.thinking
+    );
+    println!(
+        "{:<44} {:>8} {:>7} {:>5} {:>8} {:>8} {:>7} {:>5} {:>10} {:>10} {:>6}",
+        "session",
+        "requests",
+        "fit err",
+        "cold",
+        "advances",
+        "breakers",
+        "refills",
+        "read",
+        "unchanged",
+        "with edits",
+        "ratio"
+    );
+    for s in sim.sessions.iter().take(a.limit) {
+        println!(
+            "{:<44} {:>8} {:>6.1}% {:>5} {:>8} {:>8} {:>7} {:>5} {:>10} {:>10} {:>6.3}",
+            session_label(&s.file),
+            s.requests,
+            100.0 * s.fit_error,
+            s.cold,
+            s.advances,
+            if s.breakers.is_empty() { "-".to_string() } else { s.breakers.join(",") },
+            s.refilled,
+            s.read_price,
+            human(s.unchanged.cost),
+            human(s.context_edits.cost),
+            s.ratio
+        );
+    }
+    let unresolved: usize = sim.sessions.iter().map(|s| s.unresolved).sum();
+    println!(
+        "\nMean ratio over {} sessions: {:.3}{}{}",
+        sim.sessions.len(),
+        sim.mean_ratio,
+        if sim.skipped > 0 { format!(" ({} transcripts skipped: no request log)", sim.skipped) } else { String::new() },
+        if unresolved > 0 { format!("; {unresolved} messages not found, billed as empty") } else { String::new() }
+    );
+    println!(
+        "Costs are in base-input-token equivalents (cache reads and writes, input, and output at 5x). Estimate\n\
+         only: token counts are fitted, the server is emulated, and the agent is assumed to behave the same."
+    );
+    Ok(())
+}
+
 async fn cmd_bench(a: BenchArgs) -> Result<()> {
     let auth = match a.auth.as_str() {
         "subscription" => bench::Auth::Subscription,
@@ -728,8 +923,8 @@ async fn cmd_bench(a: BenchArgs) -> Result<()> {
             "billed to your API key".to_string()
         }
         bench::Auth::Subscription => {
-            if a.arms.contains(&Arm::SqueezeProxy) {
-                bail!("the squeeze-proxy arm routes API traffic through squeeze, so it needs --auth api-key");
+            if let Some(arm) = a.arms.iter().find(|a| a.is_proxied()) {
+                bail!("the {} arm routes API traffic through squeeze, so it needs --auth api-key", arm.name());
             }
             let how = if std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_ok_and(|v| !v.is_empty()) {
                 "the CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`"
@@ -800,23 +995,17 @@ async fn cmd_bench(a: BenchArgs) -> Result<()> {
 
     let store = Store::open(Store::default_root())?;
     init_logging(Some(&store.root().join("logs/squeeze.log")), "info");
-    let proxy_url = if a.arms.contains(&Arm::SqueezeProxy) {
-        let flags = CompressFlags { no_compress: false, no_dedup: false, prune_cold_cache: false, upstream: None };
-        let proxy = Proxy::new(ProxyConfig {
-            upstream: flags.upstream(),
-            transform: flags.transform(ExpandHint::Mcp),
-            store: store.clone(),
-        })?;
-        Some(format!("http://{}", proxy.spawn("127.0.0.1:0").await?))
-    } else {
-        None
-    };
+    let mut proxy_urls = BTreeMap::new();
+    for arm in a.arms.iter().filter(|a| a.is_proxied()) {
+        let proxy = Proxy::new(CompressFlags::for_arm(*arm, None)?.proxy_config(ExpandHint::Mcp, store.clone())?)?;
+        proxy_urls.insert(*arm, format!("http://{}", proxy.spawn("127.0.0.1:0").await?));
+    }
     let ctx = bench::Context {
         claude_bin: a.claude_bin.clone(),
         exe: std::env::current_exe()?,
         store_root: store.root().to_path_buf(),
         auth,
-        proxy_url,
+        proxy_urls,
         model_override: a.model.clone(),
         include_user_settings: a.include_user_settings,
         keep_dirs: a.keep,
@@ -937,7 +1126,7 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
             exe: std::env::current_exe()?,
             store_root: store.root().to_path_buf(),
             auth,
-            proxy_url: None,
+            proxy_urls: BTreeMap::new(),
             model_override: None,
             include_user_settings: false,
             keep_dirs: false,
@@ -950,8 +1139,9 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
             squeeze_linux,
             token_env_file: None,
             api_key_env_file: None,
-            proxy_url: None,
+            proxy_urls: BTreeMap::new(),
             agent_env: Vec::new(),
+            cache_ttl: a.cache_ttl,
             cpus: a.cpus,
             memory: a.memory.clone(),
             dns: a.dns.clone(),
@@ -1062,12 +1252,13 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
         }
     }
     let store = Store::open(Store::default_root())?;
-    // The squeeze-proxy arm: a proxy reachable from the task containers. Apple's
+    // Proxied arms: a proxy each, reachable from the task containers. Apple's
     // runtime reaches the host at the bridge address, so bind there, not to every
     // interface. The proxy refuses subscription credentials, as everywhere.
-    let proxy_url = if a.arms.contains(&Arm::SqueezeProxy) {
+    let mut proxy_urls = BTreeMap::new();
+    for arm in a.arms.iter().filter(|a| a.is_proxied()) {
         if runtime != atlas::Runtime::Apple {
-            bail!("the squeeze-proxy arm needs --runtime container for now");
+            bail!("the {} arm needs --runtime container for now", arm.name());
         }
         if let Some(f) = &a.api_key_env_file {
             use std::os::unix::fs::PermissionsExt;
@@ -1076,31 +1267,20 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
                 bail!("{} is readable by other users; run `chmod 600` on it", f.display());
             }
         } else if auth != bench::Auth::ApiKey {
-            bail!("the squeeze-proxy arm needs an API key: --api-key-env-file (or --auth api-key)");
+            bail!("the {} arm needs an API key: --api-key-env-file (or --auth api-key)", arm.name());
         }
-        let flags = CompressFlags {
-            no_compress: false,
-            no_dedup: false,
-            prune_cold_cache: false,
-            upstream: a.proxy_upstream.clone(),
-        };
-        let proxy = Proxy::new(ProxyConfig {
-            upstream: flags.upstream(),
-            transform: flags.transform(ExpandHint::Mcp),
-            store: store.clone(),
-        })?;
+        let flags = CompressFlags::for_arm(*arm, a.proxy_upstream.clone())?;
+        let proxy = Proxy::new(flags.proxy_config(ExpandHint::Mcp, store.clone())?)?;
         let addr = proxy.spawn(&format!("{}:0", atlas::APPLE_HOST_ADDR)).await?;
-        eprintln!("squeeze proxy for the squeeze-proxy arm at http://{addr}");
-        Some(format!("http://{addr}"))
-    } else {
-        None
-    };
+        eprintln!("squeeze proxy for the {} arm at http://{addr}", arm.name());
+        proxy_urls.insert(*arm, format!("http://{addr}"));
+    }
     let host = bench::Context {
         claude_bin: a.claude_bin.clone(),
         exe: std::env::current_exe()?,
         store_root: store.root().to_path_buf(),
         auth,
-        proxy_url: None,
+        proxy_urls: BTreeMap::new(),
         model_override: a.model.clone(),
         include_user_settings: false,
         keep_dirs: false,
@@ -1113,8 +1293,9 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
         squeeze_linux,
         token_env_file: a.token_env_file.clone(),
         api_key_env_file: a.api_key_env_file.clone(),
-        proxy_url,
+        proxy_urls,
         agent_env: a.agent_env.clone(),
+        cache_ttl: a.cache_ttl,
         cpus: a.cpus,
         memory: a.memory.clone(),
         dns: a.dns.clone(),
@@ -1286,6 +1467,42 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_sim_flags_need_cache_sim() {
+        let parse = |args: &[&str]| Cli::try_parse_from(["squeeze", "replay"].iter().chain(args));
+        let Cmd::Replay(a) = parse(&["--cache-sim", "x.jsonl"]).unwrap().cmd else { panic!("not replay") };
+        assert_eq!((a.regime, a.read_price, a.reread, a.placeholder), (Regime::FiveMinFermat, None, 0.0, 60.0));
+        assert_eq!(
+            (a.keep_tool_uses, a.keep_tool_uses_max, a.clear_tool_inputs, a.clear_thinking),
+            (8, 24, false, true)
+        );
+        let Cmd::Replay(a) =
+            parse(&["--cache-sim", "--regime", "1h", "--read-price", "0.1", "--reread", "0.25"]).unwrap().cmd
+        else {
+            panic!("not replay")
+        };
+        assert_eq!((a.regime, a.read_price, a.reread), (Regime::OneHour, Some(0.1), 0.25));
+        assert!(parse(&["--regime", "1h"]).is_err());
+        assert!(parse(&["--clear-tool-inputs"]).is_err());
+        assert!(parse(&["--cache-sim", "--max-lines", "100"]).is_err());
+        assert!(parse(&["--cache-sim", "--regime", "5m"]).is_err());
+        assert!(parse(&["--max-lines", "100"]).is_ok(), "plain replay is unchanged");
+    }
+
+    #[test]
+    fn proxied_arms_get_their_flags() {
+        let cm = CompressFlags::for_arm(Arm::SqueezeProxyCm, Some("http://u".into())).unwrap();
+        let ctx = cm.ctx().unwrap().expect("context editing on");
+        assert_eq!((ctx.window, ctx.clear_inputs, ctx.clear_thinking), (KeepWindow::default(), false, true));
+        let t = cm.transform(ExpandHint::Mcp).unwrap().unwrap();
+        assert_eq!((t.ctx_window, t.prune.enabled), (Some(ctx.window), false));
+        assert_eq!(cm.upstream(), "http://u");
+        let plain = CompressFlags::for_arm(Arm::SqueezeProxy, None).unwrap();
+        assert_eq!(plain.ctx().unwrap(), None);
+        assert_eq!(plain.transform(ExpandHint::Mcp).unwrap().unwrap().ctx_window, None);
+        assert!(CompressFlags::for_arm(Arm::Squeeze, None).is_err());
+    }
 
     #[test]
     fn merges_the_users_prompt_flags_into_squeezes() {

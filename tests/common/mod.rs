@@ -2,14 +2,34 @@
 //! every request it receives and replies with canned SSE streams or JSON.
 #![allow(dead_code)]
 
+pub mod server;
+
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use serde_json::{Value, json};
+use squeeze::proxy::Clock;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Fake wall clock for the proxy, moved by the test and by the mock upstream.
+#[derive(Default)]
+pub struct FakeClock(pub AtomicU64);
+
+impl Clock for FakeClock {
+    fn now_secs(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl FakeClock {
+    pub fn set(&self, t: u64) {
+        self.0.store(t, Ordering::SeqCst);
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Recorded {
@@ -28,6 +48,8 @@ impl Recorded {
 pub enum Reply {
     Sse(String),
     Json(u16, Value),
+    /// Close the connection without answering, as an unreachable API would.
+    Hangup,
 }
 
 pub type Script = Arc<dyn Fn(&Recorded) -> Reply + Send + Sync>;
@@ -78,6 +100,9 @@ async fn handle(State(st): State<MockState>, req: Request) -> Response {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(v.to_string()))
             .unwrap(),
+        // Unwinding the connection's task drops it unanswered; `resume_unwind`
+        // skips the panic hook, so nothing is printed.
+        Reply::Hangup => std::panic::resume_unwind(Box::new("hang up")),
     }
 }
 
@@ -129,6 +154,76 @@ pub fn sse_text(n: usize, text: &str) -> String {
         )
         + &event("content_block_stop", json!({ "type": "content_block_stop", "index": 0 }))
         + &message_end("end_turn")
+}
+
+/// A reply from `model` made of complete content `blocks`, streamed the way
+/// the API streams them, that reports `usage` at its start and, like the
+/// API's final `message_delta`, `context_management` at its end.
+pub fn sse_message(
+    n: usize,
+    model: &str,
+    blocks: &[Value],
+    stop: &str,
+    usage: Value,
+    context_management: Value,
+) -> String {
+    let mut out = event(
+        "message_start",
+        json!({ "type": "message_start", "message": {
+            "id": format!("msg_mock_{n}"), "type": "message", "role": "assistant", "model": model,
+            "content": [], "stop_reason": null, "stop_sequence": null, "usage": usage
+        }}),
+    );
+    for (index, b) in blocks.iter().enumerate() {
+        let (start, deltas) = match b["type"].as_str() {
+            Some("thinking") => {
+                let text = b["thinking"].as_str().filter(|t| !t.is_empty());
+                let thinking = text.map(|t| json!({ "type": "thinking_delta", "thinking": t }));
+                let signature = json!({ "type": "signature_delta", "signature": b["signature"] });
+                (
+                    json!({ "type": "thinking", "thinking": "", "signature": "" }),
+                    thinking.into_iter().chain([signature]).collect(),
+                )
+            }
+            Some("tool_use") => (
+                json!({ "type": "tool_use", "id": b["id"], "name": b["name"], "input": {} }),
+                vec![json!({ "type": "input_json_delta", "partial_json": b["input"].to_string() })],
+            ),
+            _ => (json!({ "type": "text", "text": "" }), vec![json!({ "type": "text_delta", "text": b["text"] })]),
+        };
+        out += &event(
+            "content_block_start",
+            json!({ "type": "content_block_start", "index": index, "content_block": start }),
+        );
+        for d in deltas {
+            out += &event("content_block_delta", json!({ "type": "content_block_delta", "index": index, "delta": d }));
+        }
+        out += &event("content_block_stop", json!({ "type": "content_block_stop", "index": index }));
+    }
+    out + &event(
+        "message_delta",
+        json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null },
+                "usage": { "output_tokens": 20 }, "context_management": context_management }),
+    ) + &event("message_stop", json!({ "type": "message_stop" }))
+}
+
+/// A stream cut short after `message_start`, by an `error` event as when the
+/// API is overloaded mid-response: usage, but no end and no edits reported.
+pub fn sse_cut_short(n: usize, usage: Value) -> String {
+    let whole = sse_message(n, "mock-model", &[], "end_turn", usage, json!({}));
+    let start = &whole[..whole.find("event: message_delta").unwrap()];
+    start.to_string()
+        + &event("error", json!({ "type": "error", "error": { "type": "overloaded_error", "message": "Overloaded" } }))
+}
+
+pub fn sse_text_with(n: usize, text: &str, usage: Value, context_management: Value) -> String {
+    sse_message(n, "mock-model", &[json!({ "type": "text", "text": text })], "end_turn", usage, context_management)
+}
+
+/// What the API's context editing would report clearing for `body`, as the
+/// emulated API in [`server`] clears it.
+pub fn emulate_context_edits(body: &Value) -> Value {
+    json!({ "applied_edits": server::cleared(body).map(|v| v.applied).unwrap_or_default() })
 }
 
 pub fn sse_tool_use(n: usize, id: &str, name: &str, input: Value) -> String {

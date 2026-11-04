@@ -19,6 +19,7 @@ max_pushbacks = 1
 max_turns = 40
 timeout_secs = 1200
 # pause_between_tickets_secs = 3700   # longer than Claude Code's 1h cache TTL: a "workday" regime
+# pause_every_n_turns = 3              # also pause before every 3rd user message (SessionBench: 330 s)
 
 [[bundle]]
 name = "calc-py"
