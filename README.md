@@ -223,9 +223,13 @@ Long runs stop sometimes. To continue one, rerun the same command with the same
 - **Claude Code version:** `--claude-linux` defaults to the host's Claude Code
   version. If the host updated in the meantime, pass the original binary's
   path so both arms use the same agent version.
-- **Grading only:** `--regrade` reruns the tests, from the saved patches, for
-  tickets that have no test score. It keeps the rubric scores and makes no model
-  calls.
+- **Grading only:** `--regrade` grades what's missing, from the saved patches:
+  tests for tickets without a test score, and, with `--auth`, the judge for
+  tickets without a rubric score. Existing scores are kept, and only the judge
+  calls a model.
+- **Faster sessions:** grading takes 10–20 minutes per ticket. `--defer-grading`
+  skips it during sessions, so they finish sooner. It doesn't change what the
+  agent does or the cost being compared. Run `--regrade --auth ...` afterwards.
 
 Findings from setting this up:
 

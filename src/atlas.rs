@@ -212,6 +212,9 @@ pub struct AtlasCtx<'a> {
     pub dns: Vec<String>,
     /// Judge all rubric items in one call instead of one call per item.
     pub judge_batch: bool,
+    /// Skip grading during the session (run `--regrade` afterwards): grading
+    /// takes 10-20 minutes per ticket and doesn't affect the agent.
+    pub defer_grading: bool,
     /// Per-session artifacts (patches, grading logs, transcripts).
     pub runs_dir: PathBuf,
 }
@@ -483,6 +486,12 @@ async fn session_inner(
                 (tr, patch)
             }
         };
+        if ctx.defer_grading {
+            eprintln!("      grading deferred (run --regrade later)");
+            res.tickets.push(tr);
+            save_checkpoint(sdir, &cfg_dir, res, started, None)?;
+            continue;
+        }
         grade(ctx, d, bundle, &task, &patch, &tdir, &mut tr, &mut res.helpers).await?;
         eprintln!(
             "      tests {} x rubric {} = {:.3}{}",
@@ -720,10 +729,16 @@ async fn grade_tests(
     Ok(())
 }
 
-/// Re-run only the test half of grading, from the saved patches, for tickets
-/// that have no test score (grading failed or was excluded before scoring).
-/// Rubric scores and existing test scores are kept; no model is called.
-pub async fn regrade(ctx: &AtlasCtx<'_>, file: &AtlasFile, results: &[SessionResult]) -> Result<Vec<SessionResult>> {
+/// Grade what is missing, from the saved patches: the tests of tickets that
+/// have no test score (grading failed, or was deferred), and, given a judge
+/// model, the rubric of tickets that have no rubric score. Existing scores
+/// are kept; only the judge calls a model.
+pub async fn regrade(
+    ctx: &AtlasCtx<'_>,
+    file: &AtlasFile,
+    results: &[SessionResult],
+    judge_model: Option<&str>,
+) -> Result<Vec<SessionResult>> {
     let mut out = Vec::new();
     for r in results {
         let mut r = r.clone();
@@ -735,15 +750,22 @@ pub async fn regrade(ctx: &AtlasCtx<'_>, file: &AtlasFile, results: &[SessionRes
         let sdir = session_dir(ctx, &r.bundle, r.arm, r.repeat, &r.session_id);
         eprintln!("regrading {} / {} / repeat {}", r.bundle, r.arm.name(), r.repeat + 1);
         for (i, tr) in r.tickets.iter_mut().enumerate() {
-            if tr.tests_frac.is_some() {
-                eprintln!("    {}: already has a test score; kept", tr.id);
+            let needs_tests = tr.tests_frac.is_none();
+            let needs_rubric = tr.rubric.is_none() && judge_model.is_some();
+            if !needs_tests && !needs_rubric {
+                eprintln!("    {}: already graded; kept", tr.id);
                 continue;
             }
             let task = load_task(&ctx.root, &tr.id)?;
             let tdir = sdir.join("tickets").join(format!("{}-{}", i + 1, tr.id));
             let patch = std::fs::read_to_string(tdir.join("agent.patch"))
                 .with_context(|| format!("no saved patch in {}", tdir.display()))?;
-            grade_tests(ctx, bundle, &task, &patch, &tdir, tr).await?;
+            if needs_tests {
+                grade_tests(ctx, bundle, &task, &patch, &tdir, tr).await?;
+            }
+            if needs_rubric {
+                tr.rubric = judge(ctx, judge_model, &task, &patch, &tdir, &mut r.helpers).await?;
+            }
             tr.reward = ticket_reward(tr);
             eprintln!(
                 "    {}: tests {} x rubric {} = {:.3}{}",

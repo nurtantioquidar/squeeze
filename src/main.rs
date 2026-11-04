@@ -221,11 +221,14 @@ struct BenchArgs {
 struct AtlasArgs {
     /// Bundle file (TOML), see bench/swe-atlas-rf.toml
     bundles_file: PathBuf,
-    /// `subscription` (needs --token-env-file) or `api-key`; not needed with --regrade
+    /// Skip grading during sessions (10-20 minutes per ticket); grade afterwards with --regrade
+    #[arg(long)]
+    defer_grading: bool,
+    /// `subscription` (needs --token-env-file) or `api-key`; with --regrade, only to judge missing rubrics
     #[arg(long)]
     auth: Option<String>,
-    /// Re-run the test grading of tickets in --out that have no test score, from their
-    /// saved patches (no model calls; rubric scores are kept). Writes <out>.regraded.jsonl
+    /// Grade what's missing in --out from the saved patches: tests without a score, and with
+    /// --auth, rubrics without a score (judge calls). Existing scores are kept. Writes <out>.regraded.jsonl
     #[arg(long)]
     regrade: bool,
     /// Env file holding CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`; passed to the
@@ -914,10 +917,17 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
             cpus: a.cpus,
             memory: a.memory.clone(),
             dns: a.dns.clone(),
-            judge_batch: false,
+            judge_batch: a.judge_batch,
+            defer_grading: false,
             runs_dir,
         };
-        let regraded = atlas::regrade(&ctx, &file, &results).await?;
+        // The judge calls a model, so it needs an explicit --auth.
+        let unjudged = results.iter().flat_map(|r| &r.tickets).filter(|t| t.rubric.is_none()).count();
+        let judge = file.defaults.judge_model.as_deref().filter(|_| a.auth.is_some());
+        if unjudged > 0 && file.defaults.judge_model.is_some() && judge.is_none() {
+            eprintln!("note: {unjudged} ticket(s) have no rubric score; pass --auth to judge them");
+        }
+        let regraded = atlas::regrade(&ctx, &file, &results, judge).await?;
         let path = PathBuf::from(format!("{}.regraded.jsonl", out_path.display()));
         let mut f = std::fs::File::create(&path)?;
         for r in &regraded {
@@ -1010,6 +1020,7 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
         memory: a.memory.clone(),
         dns: a.dns.clone(),
         judge_batch: a.judge_batch,
+        defer_grading: a.defer_grading,
         runs_dir,
     };
     let mut out = std::fs::OpenOptions::new().create(true).append(true).open(&out_path)?;
