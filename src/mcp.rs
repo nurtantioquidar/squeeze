@@ -38,7 +38,8 @@ pub const TRIMMED_BUILTINS: &[&str] = &["Workflow", "ScheduleWakeup", "ReportFin
 /// and `outline` replace when squeeze takes over file access.
 pub const REPLACED_BUILTINS: &[&str] = &["Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit", "MultiEdit"];
 
-/// Appended to Claude Code's system prompt when squeeze takes over file access.
+/// Appended to the system prompt of the agent and its subagents when squeeze
+/// takes over file access.
 pub const FILE_TOOLS_GUIDE: &str = "# File tools
 Claude Code's Read, Edit, Write, Grep and Glob tools are turned off in this session. squeeze's MCP tools replace them:
 - Read files with mcp__squeeze__read_many. Put every file and line range you need next into one call. For a large \
@@ -50,14 +51,31 @@ create a file; set overwrite to replace a whole file. Read a file with read_many
 file only to check an edit: the reply says where each edit landed.
 - Use Bash to run things: tests, builds, type checks, linters, formatters, git, package managers. Don't use Bash to \
 read or search files (cat, head, tail, sed -n, awk, grep, rg, find, ls) or to write them (sed -i, cat > file, \
-echo >, tee, scripts that rewrite files); use the tools above.
+echo >, tee, scripts that rewrite files); use the tools above.";
 
-# Working economically
+/// Appended to the main agent's system prompt with [`FILE_TOOLS_GUIDE`].
+pub const WORKING_GUIDE: &str = "# Working economically
 - Run the narrowest check that answers your question first (the tests of the files you touched, a type check of \
 one package), and pipe long output through tail or grep.
 - Review your own changes with git diff --stat and the files you changed, not a full diff of the repository.
 - Keep replies to the user short: under 120 words after each request, in 2-4 bullets covering what changed, how you \
 checked it, and anything left open.";
+
+/// With the scout: added to [`WORKING_GUIDE`].
+pub const SCOUT_GUIDE: &str = "- For broad investigation that would take three or more reads or searches across \
+files, delegate it to the Explore agent and work from its findings: its exploration stays out of your context.";
+
+/// The scout: Claude Code's Explore subagent redefined to use squeeze's tools
+/// on the session's own model (Claude Code's built-in Explore may use a smaller one).
+pub fn scout_agents_json() -> String {
+    serde_json::json!({ "Explore": {
+        "description": "Read-only code scout for questions that would take three or more reads or searches across files. Returns the files, line ranges and findings that matter.",
+        "prompt": "You are a read-only code scout. Answer the caller's question about the codebase with squeeze's tools: mcp__squeeze__search to find code, mcp__squeeze__outline for the structure of a large file, and mcp__squeeze__read_many to read the relevant ranges, several per call. Use Bash only for read-only commands such as git log; never change files. Finish in 3 to 6 tool calls unless the caller sets another budget. Reply with FILES (path and line ranges that matter), FINDINGS (what the code does, quoting only the lines the caller needs) and NEXT (what to read or change next).",
+        "tools": ["Bash", "mcp__squeeze__read_many", "mcp__squeeze__search", "mcp__squeeze__outline"],
+        "model": "inherit"
+    }})
+    .to_string()
+}
 
 /// Read-only squeeze tools, safe to pre-approve.
 pub const READ_ONLY_TOOLS: &[&str] = &["read_many", "outline", "search", "expand"];

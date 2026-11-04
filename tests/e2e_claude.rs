@@ -371,7 +371,7 @@ rubric = "anything"
             .arg(&tasks)
             .args(["--auth", "api-key", "--repeats", "1", "--yes", "--claude-bin", &claude, "--out"])
             .arg(&results)
-            .args(["--arms", "vanilla,squeeze,squeeze-full,squeeze-hook,squeeze-mcp,squeeze-proxy"])
+            .args(["--arms", "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-hook,squeeze-mcp,squeeze-proxy"])
             .args(extra)
             .env("ANTHROPIC_API_KEY", FAKE_KEY)
             .env("ANTHROPIC_BASE_URL", mock.url())
@@ -390,7 +390,7 @@ rubric = "anything"
 
     let rows: Vec<Value> =
         std::fs::read_to_string(&results).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(rows.len(), 6, "one session per arm");
+    assert_eq!(rows.len(), 7, "one session per arm");
     let mut pushbacks = 0;
     for r in &rows {
         assert!(r["error"].is_null(), "{r}");
@@ -418,13 +418,19 @@ rubric = "anything"
         .filter_map(|b| tool_result_text(b, "toolu_mock_bash1"))
         .filter(|t| t.contains("[squeeze: output compressed"))
         .count();
-    assert!(compressed >= 4, "expected compression in squeeze, squeeze-full, squeeze-hook and squeeze-proxy arms");
+    assert!(compressed >= 5, "expected compression in every hook and proxy arm");
     // squeeze-full: the built-in file tools are gone and edit_many is offered.
     let full: Vec<&Value> = reqs
         .iter()
         .filter(|b| is_main_thread(b) && b["system"].to_string().contains("turned off in this session"))
         .collect();
     assert!(!full.is_empty(), "squeeze-full sessions carry the guidance");
+    // squeeze-scout: Explore is redefined with squeeze's tools, and the agent is told to use it.
+    assert!(
+        full.iter().any(|b| b["system"].to_string().contains("delegate it to the Explore agent")
+            && b["messages"].to_string().contains("Read-only code scout")),
+        "squeeze-scout offers the scout"
+    );
     for b in full {
         let names: Vec<&str> = b["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(!names.contains(&"Read") && !names.contains(&"Edit"), "{names:?}");

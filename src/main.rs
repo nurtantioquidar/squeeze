@@ -456,6 +456,8 @@ async fn cmd_run(a: RunArgs) -> Result<i32> {
     if a.replace_file_tools {
         off.extend(squeeze::mcp::REPLACED_BUILTINS);
         args.push("--append-system-prompt".into());
+        args.push(format!("{}\n\n{}", squeeze::mcp::FILE_TOOLS_GUIDE, squeeze::mcp::WORKING_GUIDE));
+        args.push("--append-subagent-system-prompt".into());
         args.push(squeeze::mcp::FILE_TOOLS_GUIDE.into());
     }
     if a.trim_tools {

@@ -110,6 +110,9 @@ pub enum Arm {
     /// (Read/Edit/Write/Grep/Glob turned off), working guidance, and unused
     /// built-in tools trimmed (`squeeze run --replace-file-tools --trim-tools`).
     SqueezeFull,
+    /// squeeze-full plus a scout: Explore redefined on the same model with
+    /// squeeze's tools, and guidance to delegate broad investigation to it.
+    SqueezeScout,
 }
 
 impl Arm {
@@ -121,17 +124,18 @@ impl Arm {
             Arm::SqueezeMcp => "squeeze-mcp",
             Arm::SqueezeProxy => "squeeze-proxy",
             Arm::SqueezeFull => "squeeze-full",
+            Arm::SqueezeScout => "squeeze-scout",
         }
     }
     pub(crate) fn uses_mcp(self) -> bool {
-        matches!(self, Arm::Squeeze | Arm::SqueezeMcp | Arm::SqueezeProxy | Arm::SqueezeFull)
+        matches!(self, Arm::Squeeze | Arm::SqueezeMcp | Arm::SqueezeProxy | Arm::SqueezeFull | Arm::SqueezeScout)
     }
     pub(crate) fn uses_hook(self) -> bool {
-        matches!(self, Arm::Squeeze | Arm::SqueezeHook | Arm::SqueezeFull)
+        matches!(self, Arm::Squeeze | Arm::SqueezeHook | Arm::SqueezeFull | Arm::SqueezeScout)
     }
     /// squeeze's tools replace Claude Code's built-in file tools.
     pub(crate) fn replaces_file_tools(self) -> bool {
-        self == Arm::SqueezeFull
+        matches!(self, Arm::SqueezeFull | Arm::SqueezeScout)
     }
     /// squeeze tools this arm allows.
     pub(crate) fn tool_names(self) -> Vec<String> {
@@ -151,11 +155,22 @@ impl Arm {
     }
     /// Extra `claude` arguments for this arm, other than tools.
     pub(crate) fn extra_args(self) -> Vec<String> {
-        if self.replaces_file_tools() {
-            vec!["--append-system-prompt".into(), crate::mcp::FILE_TOOLS_GUIDE.into()]
-        } else {
-            Vec::new()
+        use crate::mcp::{FILE_TOOLS_GUIDE, SCOUT_GUIDE, WORKING_GUIDE};
+        if !self.replaces_file_tools() {
+            return Vec::new();
         }
+        let scout = self == Arm::SqueezeScout;
+        let working = if scout { format!("{WORKING_GUIDE}\n{SCOUT_GUIDE}") } else { WORKING_GUIDE.to_string() };
+        let mut a = vec![
+            "--append-system-prompt".into(),
+            format!("{FILE_TOOLS_GUIDE}\n\n{working}"),
+            "--append-subagent-system-prompt".into(),
+            FILE_TOOLS_GUIDE.into(),
+        ];
+        if scout {
+            a.extend(["--agents".into(), crate::mcp::scout_agents_json()]);
+        }
+        a
     }
 }
 
@@ -169,9 +184,10 @@ impl std::str::FromStr for Arm {
             "squeeze-mcp" => Arm::SqueezeMcp,
             "squeeze-proxy" => Arm::SqueezeProxy,
             "squeeze-full" => Arm::SqueezeFull,
+            "squeeze-scout" => Arm::SqueezeScout,
             other => {
                 bail!(
-                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-hook, squeeze-mcp, squeeze-proxy)"
+                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-hook, squeeze-mcp, squeeze-proxy)"
                 )
             }
         })
