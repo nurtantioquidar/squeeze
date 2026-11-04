@@ -949,14 +949,6 @@ pub async fn regrade_session(
 /// back to the binary score. Also returns how many tests ran at baseline.
 pub fn tests_score(verifier: &Path) -> Result<(f64, f64, u64)> {
     let comp: Value = serde_json::from_str(&std::fs::read_to_string(verifier.join("comparison_results.json"))?)?;
-    if let Some(e) = comp.get("error") {
-        bail!("{e}");
-    }
-    let binary = comp.get("tests_reward").and_then(Value::as_f64).unwrap_or(0.0);
-    let n = |k: &str| comp.pointer(&format!("/filtered_summary/{k}")).and_then(Value::as_u64).unwrap_or(0);
-    let denom = n("missing_to_pass") + n("missing_to_fail") + n("pass_to_fail");
-    let frac =
-        if denom > 0 { (n("missing_to_pass") as f64 / denom as f64 * 10_000.0).round() / 10_000.0 } else { binary };
     let ran = std::fs::read_to_string(verifier.join("agent_baseline_results.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
@@ -965,6 +957,23 @@ pub fn tests_score(verifier: &Path) -> Result<(f64, f64, u64)> {
             c("passed_test_count") + c("failed_test_count")
         })
         .unwrap_or(0);
+    if let Some(e) = comp.get("error") {
+        // The baseline ran but the agent's side couldn't be tested, for example
+        // because the agent deleted a file the hidden test patch changes, so
+        // that patch no longer applies. SWE-Atlas scores that with its own
+        // tests_reward (0): an outcome of the agent's work, not a reason to
+        // drop the ticket from the mean.
+        let own = std::fs::read_to_string(verifier.join("tests_reward.txt")).ok().and_then(|t| t.trim().parse().ok());
+        return match own {
+            Some(r) if ran > 0 => Ok((r, r, ran)),
+            _ => bail!("{e}"),
+        };
+    }
+    let binary = comp.get("tests_reward").and_then(Value::as_f64).unwrap_or(0.0);
+    let n = |k: &str| comp.pointer(&format!("/filtered_summary/{k}")).and_then(Value::as_u64).unwrap_or(0);
+    let denom = n("missing_to_pass") + n("missing_to_fail") + n("pass_to_fail");
+    let frac =
+        if denom > 0 { (n("missing_to_pass") as f64 / denom as f64 * 10_000.0).round() / 10_000.0 } else { binary };
     Ok((frac, binary, ran))
 }
 
@@ -1150,6 +1159,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tests_score(dir.path()).unwrap(), (1.0, 1.0, 0), "falls back to binary; 0 ran = vacuous");
+    }
+
+    #[test]
+    fn a_patch_that_breaks_the_test_patch_scores_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = r#"{"error": "[Errno 2] No such file or directory: '/tmp_artifact_storage/agent_comparison_results.json'"}"#;
+        std::fs::write(dir.path().join("comparison_results.json"), error).unwrap();
+        std::fs::write(
+            dir.path().join("agent_baseline_results.json"),
+            r#"{"passed_test_count": 337, "failed_test_count": 0}"#,
+        )
+        .unwrap();
+        // Without SWE-Atlas's own score it's a grading error, as before.
+        assert!(tests_score(dir.path()).is_err());
+        std::fs::write(dir.path().join("tests_reward.txt"), "0.0\n").unwrap();
+        assert_eq!(tests_score(dir.path()).unwrap(), (0.0, 0.0, 337), "SWE-Atlas's own score: 0, counted");
+        // If even the baseline didn't run, the environment is at fault: still an error.
+        std::fs::write(
+            dir.path().join("agent_baseline_results.json"),
+            r#"{"passed_test_count": 0, "failed_test_count": 0}"#,
+        )
+        .unwrap();
+        assert!(tests_score(dir.path()).is_err());
     }
 
     #[test]
