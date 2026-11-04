@@ -1,0 +1,56 @@
+# Example bundle for `squeeze bench`, in the structure of SessionBench (the
+# benchmark published for Fermat): related tickets run as one resumed Claude
+# Code session, a simulated user reviews each ticket, reward = tests x rubric.
+#
+# This bundle is a small smoke/demo workload, not a representative benchmark.
+# Its verbose test run gives squeeze some log output to work on.
+#
+#   squeeze bench bench/example.toml --auth subscription --repeats 3
+#   squeeze bench bench/example.toml --auth api-key --repeats 5 --arms vanilla,squeeze,squeeze-hook,squeeze-mcp
+#
+# Like SessionBench, every role runs on Opus. Override with --model,
+# --usersim-model and --judge-model.
+
+[defaults]
+model = "claude-opus-5-5"
+usersim_model = "claude-opus-5-5"
+judge_model = "claude-opus-5-5"
+max_pushbacks = 1
+max_turns = 40
+timeout_secs = 1200
+# pause_between_tickets_secs = 3700   # longer than Claude Code's 1h cache TTL: a "workday" regime
+
+[[bundle]]
+name = "calc-py"
+repo = "fixtures/calc-py"
+hidden = "fixtures/calc-py-hidden"
+
+[[bundle.ticket]]
+id = "fix-mean"
+prompt = "The test suite fails. Run it with `python3 -m unittest -v`, find the bug in the library code (not the tests), and fix it."
+test = "python3 -m unittest -q"
+rubric = "Fixes the off-by-one denominator in mean(). Does not modify or weaken tests. Minimal, focused change."
+
+[[bundle.ticket]]
+id = "add-mode"
+prompt = "Add `mode(values)` to the calc package: it returns the most common value, ties go to the smallest value, and an empty input raises ValueError. Add unit tests for it, then run the whole suite with `python3 -m unittest -v`."
+test = "python3 -m unittest -q && PYTHONPATH=. python3 \"$SQUEEZE_BENCH_HIDDEN/test_mode.py\""
+rubric = "mode() is correct for ties and empty input, is exported from calc, and comes with its own tests."
+
+[[bundle.ticket]]
+id = "empty-input"
+prompt = "mean() and median() misbehave on an empty list. Make both raise ValueError('empty input'), add tests, and run the suite with `python3 -m unittest -v`."
+test = "python3 -m unittest -q && PYTHONPATH=. python3 \"$SQUEEZE_BENCH_HIDDEN/test_empty.py\""
+rubric = "Both functions raise ValueError('empty input') before doing any arithmetic; tests cover it; nothing else changes."
+
+[[bundle.ticket]]
+id = "cli"
+prompt = "Add a command-line interface: `python3 -m calc mean 1 2 3` prints the result (likewise for median and mode). An unknown command exits with status 2 and prints usage to stderr. Run the suite afterwards."
+test = "python3 -m unittest -q && PYTHONPATH=. python3 \"$SQUEEZE_BENCH_HIDDEN/test_cli.py\""
+rubric = "Implements calc/__main__.py with argument parsing, correct exit codes and usage on stderr; numbers are parsed as floats or ints sensibly."
+
+[[bundle.ticket]]
+id = "split-module"
+prompt = "Refactor: move mean, median and mode into a new module calc/stats.py. `from calc import mean, median, mode` must keep working and behavior must not change. Run the full suite with `python3 -m unittest -v`."
+test = "python3 -m unittest -q && PYTHONPATH=. python3 \"$SQUEEZE_BENCH_HIDDEN/test_layout.py\""
+rubric = "calc/stats.py holds the implementations; calc/__init__.py re-exports them; the CLI still works; no behavior change."

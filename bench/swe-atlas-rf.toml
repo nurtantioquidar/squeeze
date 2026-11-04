@@ -1,0 +1,54 @@
+# The three SessionBench bundles (github.com/akuik/sessionbench-swe,
+# bundles/swe-atlas-rf-v1.json, Apache-2.0) over SWE-Atlas refactoring tasks
+# (github.com/scaleapi/SWE-Atlas, data/rf, Apache-2.0). If you publish results,
+# please cite SWE-Atlas.
+#
+#   squeeze bench-atlas bench/swe-atlas-rf.toml --auth subscription \
+#     --token-env-file ~/.config/squeeze/claude-token.env --bundles grafana_ts --repeats 1
+#
+# Every role runs on Opus, as in SessionBench. Each ticket runs in its task's
+# container (linux/amd64; about 4.5 GB per grafana image, 0.4 GB per scapy image).
+
+[defaults]
+model = "claude-opus-5-5"
+usersim_model = "claude-opus-5-5"
+judge_model = "claude-opus-5-5"
+max_pushbacks = 2
+timeout_secs = 10800   # SWE-Atlas's agent timeout per ticket
+
+[[atlas_bundle]]
+name = "grafana_go"
+workdir = "/grafana"
+tasks = [
+  "task-696719205599a51110d4b455",
+  "task-697e7458be1623d850a8885b",
+  "task-696719205599a51110d4b462",
+  "task-696719205599a51110d4b45b",
+  "task-696719205599a51110d4b458",
+]
+
+[[atlas_bundle]]
+name = "grafana_ts"
+workdir = "/grafana"
+tasks = [
+  "task-696719205599a51110d4b45f",
+  "task-697e7458be1623d850a8885d",
+  "task-697e7458be1623d850a88862",
+  "task-69d196f015a150488265afbb",
+  "task-69d196f015a150488265afbc",
+]
+
+[[atlas_bundle]]
+name = "scapy_py_scoped"
+workdir = "/app"
+# The scapy images put a Python 3.12 venv (/opt/venv) first on PATH, and
+# scapy's bundled `six` cannot import under 3.12, so the official test.sh runs
+# zero tests (a vacuous score). Grading uses the image's own Python 3.8 instead.
+grade_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+tasks = [
+  "task-696719205599a51110d4b476",
+  "task-697e7458be1623d850a88838",
+  "task-697e7458be1623d850a8883b",
+  "task-69d196f015a150488265afb6",
+  "task-69d196f015a150488265afb7",
+]
