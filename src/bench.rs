@@ -106,6 +106,10 @@ pub enum Arm {
     SqueezeMcp,
     /// Proxy compression + MCP tools (API key only).
     SqueezeProxy,
+    /// Hook compression + MCP tools that replace Claude Code's file tools
+    /// (Read/Edit/Write/Grep/Glob turned off), working guidance, and unused
+    /// built-in tools trimmed (`squeeze run --replace-file-tools --trim-tools`).
+    SqueezeFull,
 }
 
 impl Arm {
@@ -116,13 +120,42 @@ impl Arm {
             Arm::SqueezeHook => "squeeze-hook",
             Arm::SqueezeMcp => "squeeze-mcp",
             Arm::SqueezeProxy => "squeeze-proxy",
+            Arm::SqueezeFull => "squeeze-full",
         }
     }
     pub(crate) fn uses_mcp(self) -> bool {
-        matches!(self, Arm::Squeeze | Arm::SqueezeMcp | Arm::SqueezeProxy)
+        matches!(self, Arm::Squeeze | Arm::SqueezeMcp | Arm::SqueezeProxy | Arm::SqueezeFull)
     }
     pub(crate) fn uses_hook(self) -> bool {
-        matches!(self, Arm::Squeeze | Arm::SqueezeHook)
+        matches!(self, Arm::Squeeze | Arm::SqueezeHook | Arm::SqueezeFull)
+    }
+    /// squeeze's tools replace Claude Code's built-in file tools.
+    pub(crate) fn replaces_file_tools(self) -> bool {
+        self == Arm::SqueezeFull
+    }
+    /// squeeze tools this arm allows.
+    pub(crate) fn tool_names(self) -> Vec<String> {
+        let mut t = if self.uses_mcp() { squeeze_tool_names() } else { Vec::new() };
+        if self.replaces_file_tools() {
+            t.push("mcp__squeeze__edit_many".into());
+        }
+        t
+    }
+    /// Built-in tools this arm turns off (on top of the bench's own list).
+    pub(crate) fn disallowed_tools(self) -> Vec<String> {
+        if self.replaces_file_tools() {
+            crate::mcp::REPLACED_BUILTINS.iter().chain(crate::mcp::TRIMMED_BUILTINS).map(|s| s.to_string()).collect()
+        } else {
+            Vec::new()
+        }
+    }
+    /// Extra `claude` arguments for this arm, other than tools.
+    pub(crate) fn extra_args(self) -> Vec<String> {
+        if self.replaces_file_tools() {
+            vec!["--append-system-prompt".into(), crate::mcp::FILE_TOOLS_GUIDE.into()]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -135,7 +168,12 @@ impl std::str::FromStr for Arm {
             "squeeze-hook" => Arm::SqueezeHook,
             "squeeze-mcp" => Arm::SqueezeMcp,
             "squeeze-proxy" => Arm::SqueezeProxy,
-            other => bail!("unknown arm {other:?} (vanilla, squeeze, squeeze-hook, squeeze-mcp, squeeze-proxy)"),
+            "squeeze-full" => Arm::SqueezeFull,
+            other => {
+                bail!(
+                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-hook, squeeze-mcp, squeeze-proxy)"
+                )
+            }
         })
     }
 }
@@ -273,11 +311,15 @@ pub(crate) fn uuid_v4(seed: &str) -> String {
     format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
 }
 
-fn mcp_config(ctx: &Context, root: &Path) -> String {
+fn mcp_config(ctx: &Context, root: &Path, edit_tool: bool) -> String {
+    let mut args = vec!["mcp".to_string(), "--root".into(), root.display().to_string()];
+    if edit_tool {
+        args.push("--edit-tool".into());
+    }
     json!({ "mcpServers": { "squeeze": {
         "type": "stdio",
         "command": ctx.exe,
-        "args": ["mcp", "--root", root],
+        "args": args,
         "env": { "SQUEEZE_HOME": ctx.store_root },
         "alwaysLoad": true
     }}})
@@ -504,14 +546,16 @@ async fn session_inner(r: &Run<'_>, model: Option<&str>, res: &mut SessionResult
         .clone()
         .or_else(|| d.allowed_tools.clone())
         .unwrap_or_else(|| DEFAULT_TOOLS.iter().map(|s| s.to_string()).collect());
-    if r.arm.uses_mcp() {
-        tools.extend(squeeze_tool_names());
-    }
-    let mcp = if r.arm.uses_mcp() { mcp_config(ctx, &work) } else { r#"{"mcpServers":{}}"#.to_string() };
+    tools.extend(r.arm.tool_names());
+    let mcp = if r.arm.uses_mcp() {
+        mcp_config(ctx, &work, r.arm.replaces_file_tools())
+    } else {
+        r#"{"mcpServers":{}}"#.to_string()
+    };
     let settings = if r.arm.uses_hook() {
         Some(crate::hook::session_settings(&ctx.exe, r.arm.uses_mcp()))
     } else if r.arm.uses_mcp() {
-        Some(json!({ "permissions": { "allow": squeeze_tool_names() } }))
+        Some(json!({ "permissions": { "allow": r.arm.tool_names() } }))
     } else {
         None
     };
@@ -538,6 +582,12 @@ async fn session_inner(r: &Run<'_>, model: Option<&str>, res: &mut SessionResult
         a.extend(["--strict-mcp-config".into(), "--mcp-config".into(), mcp.clone()]);
         if let Some(s) = &settings {
             a.extend(["--settings".into(), s.to_string()]);
+        }
+        a.extend(r.arm.extra_args());
+        let disallowed = r.arm.disallowed_tools();
+        if !disallowed.is_empty() {
+            a.push("--disallowedTools".into());
+            a.extend(disallowed);
         }
         a.extend([if resume { "--resume" } else { "--session-id" }.to_string(), session_id.clone()]);
         a.push("--allowedTools".into()); // variadic: keep last

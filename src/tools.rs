@@ -55,6 +55,34 @@ impl Workspace {
         Ok(canon)
     }
 
+    /// Resolve a path for a file that may not exist yet: its nearest existing
+    /// ancestor must be inside the root, and the rest may not contain `..`.
+    fn resolve_new(&self, path: &str) -> Result<PathBuf> {
+        if let Ok(p) = self.resolve(path) {
+            return Ok(p);
+        }
+        let p = Path::new(path);
+        let joined = if p.is_absolute() { p.to_path_buf() } else { self.root.join(p) };
+        let mut base = joined.as_path();
+        let mut rest = Vec::new();
+        while !base.exists() {
+            let name = base.file_name().with_context(|| format!("{path}: invalid path"))?;
+            rest.push(name.to_os_string());
+            base = base.parent().with_context(|| format!("{path}: invalid path"))?;
+        }
+        if joined.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            bail!("{path}: `..` is not allowed in a new file's path");
+        }
+        let mut canon = base.canonicalize()?;
+        if !self.allow_outside_root && !canon.starts_with(&self.root) {
+            bail!("{path}: outside the project root {}", self.root.display());
+        }
+        for part in rest.into_iter().rev() {
+            canon.push(part);
+        }
+        Ok(canon)
+    }
+
     fn display(&self, p: &Path) -> String {
         match p.strip_prefix(&self.root) {
             Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
@@ -182,27 +210,23 @@ impl Workspace {
     }
 
     pub fn search(&self, args: &Value) -> Result<String> {
-        let pattern = arg_str(args, "pattern").context("`pattern` is required")?;
+        let Some(pattern) = arg_str(args, "pattern").filter(|p| !p.is_empty()) else {
+            return self.list_files(args);
+        };
         let ctx = arg_usize(args, "context").unwrap_or(0).min(10);
         let max = arg_usize(args, "max_matches").unwrap_or(100).clamp(1, 1000);
+        let files_only = arg_bool(args, "files_only");
         let source = if arg_bool(args, "fixed_string") { regex::escape(pattern) } else { pattern.to_string() };
         let re = RegexBuilder::new(&source)
             .case_insensitive(arg_bool(args, "ignore_case"))
             .size_limit(10 << 20)
             .build()
             .with_context(|| format!("invalid regex {pattern:?}"))?;
-        let base = self.resolve(arg_str(args, "path").unwrap_or("."))?;
-        let mut wb = WalkBuilder::new(&base);
-        wb.sort_by_file_name(|a, b| a.cmp(b)).require_git(false);
-        if let Some(glob) = arg_str(args, "glob") {
-            let mut ob = OverrideBuilder::new(&base);
-            ob.add(glob).with_context(|| format!("invalid glob {glob:?}"))?;
-            wb.overrides(ob.build()?);
-        }
+        let (base, walk) = self.walker(args)?;
 
         let mut out = String::new();
         let (mut shown, mut total, mut files_with) = (0usize, 0usize, 0usize);
-        for entry in wb.build().flatten() {
+        for entry in walk.flatten() {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -222,6 +246,11 @@ impl Workspace {
             files_with += 1;
             total += hits.len();
             if shown >= max {
+                continue;
+            }
+            if files_only {
+                shown += 1;
+                let _ = writeln!(out, "{} ({} matches)", self.display(entry.path()), hits.len());
                 continue;
             }
             let take: Vec<usize> = hits.iter().copied().take(max - shown).collect();
@@ -250,8 +279,49 @@ impl Workspace {
             return Ok(format!("No matches for /{pattern}/ under {}.", self.display(&base)));
         }
         let _ = write!(out, "{total} matches in {files_with} files");
-        if total > shown {
+        if files_only && files_with > shown {
+            let _ = write!(out, " (listing the first {shown} files)");
+        } else if !files_only && total > shown {
             let _ = write!(out, " (showing the first {shown}; narrow the pattern, path or glob to see more)");
+        }
+        out.push('\n');
+        Ok(out)
+    }
+
+    /// A gitignore-aware walk under `path`, filtered by `glob`.
+    fn walker(&self, args: &Value) -> Result<(PathBuf, ignore::Walk)> {
+        let base = self.resolve(arg_str(args, "path").unwrap_or("."))?;
+        let mut wb = WalkBuilder::new(&base);
+        wb.sort_by_file_name(|a, b| a.cmp(b)).require_git(false);
+        if let Some(glob) = arg_str(args, "glob") {
+            let mut ob = OverrideBuilder::new(&base);
+            ob.add(glob).with_context(|| format!("invalid glob {glob:?}"))?;
+            wb.overrides(ob.build()?);
+        }
+        Ok((base, wb.build()))
+    }
+
+    /// `search` without a pattern: list files (like `find`/`ls -R`), honoring .gitignore.
+    fn list_files(&self, args: &Value) -> Result<String> {
+        let max = arg_usize(args, "max_matches").unwrap_or(200).clamp(1, 2000);
+        let (base, walk) = self.walker(args)?;
+        let mut out = String::new();
+        let mut total = 0usize;
+        for entry in walk.flatten() {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            total += 1;
+            if total <= max {
+                let _ = writeln!(out, "{}", self.display(entry.path()));
+            }
+        }
+        if total == 0 {
+            return Ok(format!("No files under {}.", self.display(&base)));
+        }
+        let _ = write!(out, "{total} files");
+        if total > max {
+            let _ = write!(out, " (showing the first {max}; narrow the path or glob)");
         }
         out.push('\n');
         Ok(out)
@@ -273,69 +343,114 @@ impl Workspace {
         Ok(out)
     }
 
-    /// Apply several exact-string edits, validated in full before any file is written.
+    /// Apply several edits (exact-string replacements, new files, full
+    /// rewrites), validated in full before any file is written.
     pub fn edit_many(&mut self, args: &Value) -> Result<String> {
         let edits = args.get("edits").and_then(Value::as_array).context("`edits` (an array) is required")?;
         if edits.is_empty() || edits.len() > 100 {
             bail!("`edits` must contain 1 to 100 entries");
         }
+        struct Edit<'a> {
+            old: &'a str,
+            new: &'a str,
+            all: bool,
+            overwrite: bool,
+        }
         let mut order: Vec<PathBuf> = Vec::new();
-        let mut by_path: HashMap<PathBuf, Vec<(&str, &str, bool)>> = HashMap::new();
+        let mut by_path: HashMap<PathBuf, Vec<Edit>> = HashMap::new();
         for (i, e) in edits.iter().enumerate() {
             let path = arg_str(e, "path").with_context(|| format!("edit {}: `path` is required", i + 1))?;
-            let old = arg_str(e, "old_string").with_context(|| format!("edit {}: `old_string` is required", i + 1))?;
             let new = arg_str(e, "new_string").with_context(|| format!("edit {}: `new_string` is required", i + 1))?;
-            if old.is_empty() {
-                bail!("edit {}: `old_string` must not be empty", i + 1);
-            }
-            if old == new {
+            let edit = Edit {
+                old: arg_str(e, "old_string").unwrap_or(""),
+                new,
+                all: arg_bool(e, "replace_all"),
+                overwrite: arg_bool(e, "overwrite"),
+            };
+            if !edit.overwrite && !edit.old.is_empty() && edit.old == edit.new {
                 bail!("edit {}: `old_string` and `new_string` are identical", i + 1);
             }
-            let canon = self.resolve(path)?;
+            let canon = self.resolve_new(path)?;
+            if canon.is_dir() {
+                bail!("edit {}: {path} is a directory", i + 1);
+            }
             if !by_path.contains_key(&canon) {
                 order.push(canon.clone());
             }
-            by_path.entry(canon).or_default().push((old, new, arg_bool(e, "replace_all")));
+            by_path.entry(canon).or_default().push(edit);
         }
 
-        let mut staged: Vec<(PathBuf, String, Vec<usize>)> = Vec::new();
+        // (path, new content, existed, what was done)
+        let mut staged: Vec<(PathBuf, String, bool, String)> = Vec::new();
         for path in &order {
             let shown = self.display(path);
-            let bytes = self.load(path)?;
-            match self.reads.get(path) {
-                None => bail!("{shown}: read it with read_many before editing"),
-                Some(h) if *h != blake3::hash(&bytes) => {
-                    bail!("{shown}: the file changed since you last read it with read_many; read it again")
-                }
-                Some(_) => {}
-            }
-            let mut text = String::from_utf8(bytes).map_err(|_| anyhow!("{shown}: not valid UTF-8"))?;
+            let existed = path.exists();
+            let (mut text, mut note) = if existed {
+                let bytes = self.load(path)?;
+                let stale = match self.reads.get(path) {
+                    None => bail!("{shown}: read it with read_many before editing it"),
+                    Some(h) => *h != blake3::hash(&bytes),
+                };
+                let text = String::from_utf8(bytes).map_err(|_| anyhow!("{shown}: not valid UTF-8"))?;
+                (text, if stale { " (the file had changed since you read it; matched exactly)" } else { "" })
+            } else {
+                (String::new(), "")
+            };
             let mut lines = Vec::new();
-            for (i, (old, new, all)) in by_path[path].iter().enumerate() {
-                let count = text.matches(old).count();
-                if count == 0 {
-                    bail!("{shown}: edit {} of this file: old_string not found", i + 1);
+            let mut action = None;
+            for (i, e) in by_path[path].iter().enumerate() {
+                let n = i + 1;
+                if e.overwrite || (e.old.is_empty() && !existed && i == 0) {
+                    text = e.new.to_string();
+                    action = Some(if existed { "rewritten" } else { "created" });
+                    note = "";
+                    continue;
                 }
-                if count > 1 && !all {
+                if e.old.is_empty() {
                     bail!(
-                        "{shown}: edit {} of this file: old_string matches {count} times; add surrounding context or set replace_all",
-                        i + 1
+                        "{shown}: edit {n} of this file: `old_string` is empty; set overwrite to replace the whole file"
                     );
                 }
-                let at = text.find(old).expect("counted above");
+                let count = text.matches(e.old).count();
+                if count == 0 {
+                    bail!("{shown}: edit {n} of this file: old_string not found");
+                }
+                if count > 1 && !e.all {
+                    bail!(
+                        "{shown}: edit {n} of this file: old_string matches {count} times; add surrounding context or set replace_all"
+                    );
+                }
+                let at = text.find(e.old).expect("counted above");
                 lines.push(text[..at].matches('\n').count() + 1);
-                text = if *all { text.replace(old, new) } else { text.replacen(old, new, 1) };
+                text = if e.all { text.replace(e.old, e.new) } else { text.replacen(e.old, e.new, 1) };
             }
-            staged.push((path.clone(), text, lines));
+            let mut what = match action {
+                Some(a) => format!("{a} ({} lines)", text.lines().count()),
+                None => String::new(),
+            };
+            if !lines.is_empty() {
+                let at: Vec<String> = lines.iter().map(usize::to_string).collect();
+                if !what.is_empty() {
+                    what.push_str(", then ");
+                }
+                let _ = write!(what, "{} edit(s) applied at line(s) {}", lines.len(), at.join(", "));
+            }
+            what.push_str(note);
+            staged.push((path.clone(), text, existed, what));
         }
 
         let mut out = String::new();
-        for (path, text, lines) in staged {
-            write_preserving_permissions(&path, text.as_bytes())?;
+        for (path, text, existed, what) in staged {
+            if existed {
+                write_preserving_permissions(&path, text.as_bytes())?;
+            } else {
+                if let Some(dir) = path.parent() {
+                    fs::create_dir_all(dir)?;
+                }
+                fs::write(&path, text.as_bytes())?;
+            }
             self.reads.insert(path.clone(), blake3::hash(text.as_bytes()));
-            let at: Vec<String> = lines.iter().map(usize::to_string).collect();
-            let _ =
-                writeln!(out, "{}: {} edit(s) applied at line(s) {}", self.display(&path), lines.len(), at.join(", "));
+            let _ = writeln!(out, "{}: {what}", self.display(&path));
         }
         Ok(out)
     }
@@ -416,9 +531,51 @@ mod tests {
         assert_eq!(out, "src/a.rs: 1 edit(s) applied at line(s) 2\n");
         assert!(fs::read_to_string(&a).unwrap().contains("let x = 2;"));
 
+        // Changed since the read (say, by a formatter): applied by exact match, with a note.
         fs::write(&a, "changed elsewhere\n").unwrap();
         let again = json!({ "edits": [{ "path": "src/a.rs", "old_string": "changed", "new_string": "x" }] });
-        assert!(ws.edit_many(&again).unwrap_err().to_string().contains("changed since you last read it"));
+        let out = ws.edit_many(&again).unwrap();
+        assert!(out.contains("had changed since you read it"), "{out}");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "x elsewhere\n");
+    }
+
+    #[test]
+    fn edit_many_creates_and_rewrites_files() {
+        let (d, mut ws) = setup();
+        let out = ws
+            .edit_many(&json!({ "edits": [
+                { "path": "src/new/mod.rs", "new_string": "pub fn f() {}\n" },
+                { "path": "src/new/mod.rs", "old_string": "f()", "new_string": "g()" }
+            ] }))
+            .unwrap();
+        assert_eq!(out, "src/new/mod.rs: created (1 lines), then 1 edit(s) applied at line(s) 1\n");
+        assert_eq!(fs::read_to_string(d.path().join("proj/src/new/mod.rs")).unwrap(), "pub fn g() {}\n");
+
+        // Existing files: empty old_string needs overwrite, and overwrite needs a read.
+        let rewrite = json!({ "edits": [{ "path": "src/b.py", "new_string": "x = 1\n", "overwrite": true }] });
+        assert!(ws.edit_many(&rewrite).unwrap_err().to_string().contains("read it with read_many"));
+        ws.read_many(&json!({ "files": ["src/b.py"] })).unwrap();
+        let empty = json!({ "edits": [{ "path": "src/b.py", "old_string": "", "new_string": "y" }] });
+        assert!(ws.edit_many(&empty).unwrap_err().to_string().contains("set overwrite"));
+        assert_eq!(ws.edit_many(&rewrite).unwrap(), "src/b.py: rewritten (1 lines)\n");
+        assert_eq!(fs::read_to_string(d.path().join("proj/src/b.py")).unwrap(), "x = 1\n");
+
+        // New files stay inside the root.
+        let escape = json!({ "edits": [{ "path": "../evil.txt", "new_string": "x" }] });
+        assert!(ws.edit_many(&escape).is_err());
+        let sneaky = json!({ "edits": [{ "path": "src/nope/../../../evil.txt", "new_string": "x" }] });
+        assert!(ws.edit_many(&sneaky).is_err());
+        assert!(!d.path().join("evil.txt").exists());
+    }
+
+    #[test]
+    fn search_lists_files_without_a_pattern() {
+        let (_d, ws) = setup();
+        let out = ws.search(&json!({ "glob": "*.rs" })).unwrap();
+        assert_eq!(out, "src/a.rs\n1 files\n", "gitignored target/ is skipped");
+        let out = ws.search(&json!({ "pattern": "e", "files_only": true })).unwrap();
+        assert!(out.contains("src/a.rs (1 matches)\nsrc/b.py (2 matches)\n"), "{out}");
+        assert!(!out.contains("println"), "files_only prints no lines");
     }
 
     #[test]

@@ -22,6 +22,43 @@ Keep using Bash for running tests, builds, type checks, git and other commands, 
 you Edit it (Edit requires it). Outputs marked [squeeze: ...] were compressed; call expand with the id given there \
 to see the full original.";
 
+/// [`INSTRUCTIONS`] when the server also edits files (`--edit-tool`).
+pub const INSTRUCTIONS_WITH_EDIT: &str = "squeeze's tools read, search and change code in fewer turns and fewer tokens \
+than shell commands or one-file-at-a-time tools. Read with read_many (every file and range you need next, in one \
+call), outline a large file before reading it, search instead of grep -rn, and change files with edit_many (every \
+edit you have ready, in one call; files must have been read with read_many). Keep using Bash for tests, builds, type \
+checks and git. Outputs marked [squeeze: ...] were compressed; call expand with the id given there for the original.";
+
+/// Built-in tools for features a coding session doesn't use (multi-agent
+/// workflows, /loop wakeups, review reports, agent teams). Each is loaded in
+/// full on every request, about 3.5k tokens together.
+pub const TRIMMED_BUILTINS: &[&str] = &["Workflow", "ScheduleWakeup", "ReportFindings", "ListAgents"];
+
+/// Claude Code's built-in file tools that `edit_many`, `read_many`, `search`
+/// and `outline` replace when squeeze takes over file access.
+pub const REPLACED_BUILTINS: &[&str] = &["Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit", "MultiEdit"];
+
+/// Appended to Claude Code's system prompt when squeeze takes over file access.
+pub const FILE_TOOLS_GUIDE: &str = "# File tools
+Claude Code's Read, Edit, Write, Grep and Glob tools are turned off in this session. squeeze's MCP tools replace them:
+- Read files with mcp__squeeze__read_many. Put every file and line range you need next into one call. For a large \
+file, call mcp__squeeze__outline first and read only the ranges you need.
+- Find code with mcp__squeeze__search (regex, grouped by file, with context lines). files_only lists just the \
+matching files; without a pattern it lists files.
+- Change files with mcp__squeeze__edit_many. Batch every edit you have ready into one call. Omit old_string to \
+create a file; set overwrite to replace a whole file. Read a file with read_many before you edit it. Don't re-read a \
+file only to check an edit: the reply says where each edit landed.
+- Use Bash to run things: tests, builds, type checks, linters, formatters, git, package managers. Don't use Bash to \
+read or search files (cat, head, tail, sed -n, awk, grep, rg, find, ls) or to write them (sed -i, cat > file, \
+echo >, tee, scripts that rewrite files); use the tools above.
+
+# Working economically
+- Run the narrowest check that answers your question first (the tests of the files you touched, a type check of \
+one package), and pipe long output through tail or grep.
+- Review your own changes with git diff --stat and the files you changed, not a full diff of the repository.
+- Keep replies to the user short: under 120 words after each request, in 2-4 bullets covering what changed, how you \
+checked it, and anything left open.";
+
 /// Read-only squeeze tools, safe to pre-approve.
 pub const READ_ONLY_TOOLS: &[&str] = &["read_many", "outline", "search", "expand"];
 
@@ -74,7 +111,7 @@ impl Server {
             "protocolVersion": version,
             "capabilities": { "tools": { "listChanged": false } },
             "serverInfo": { "name": "squeeze", "version": crate::VERSION },
-            "instructions": INSTRUCTIONS,
+            "instructions": if self.edit_tool { INSTRUCTIONS_WITH_EDIT } else { INSTRUCTIONS },
         })
     }
 
@@ -136,19 +173,19 @@ impl Server {
             json!({
                 "name": "search",
                 "title": "Search code",
-                "description": "Regex search across the project, honoring .gitignore. Results are grouped by file (path printed once) with optional context lines and a match budget, so output stays small. Use glob to restrict files (for example \"*.rs\" or \"src/**/*.ts\").",
+                "description": "Regex search across the project, honoring .gitignore. Results are grouped by file (path printed once) with optional context lines and a match budget, so output stays small. Use glob to restrict files (for example \"*.rs\" or \"src/**/*.ts\"). files_only lists matching files with match counts (like grep -l). Without a pattern it lists files (like find or ls -R).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Regular expression (Rust regex syntax)." },
+                        "pattern": { "type": "string", "description": "Regular expression (Rust regex syntax). Omit to list files." },
                         "path": { "type": "string", "description": "Directory or file to search (default: project root)." },
                         "glob": { "type": "string" },
                         "ignore_case": { "type": "boolean" },
                         "fixed_string": { "type": "boolean", "description": "Treat pattern as a literal string." },
                         "context": { "type": "integer", "minimum": 0, "maximum": 10 },
-                        "max_matches": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Default 100." }
-                    },
-                    "required": ["pattern"]
+                        "files_only": { "type": "boolean", "description": "List matching files with match counts instead of lines." },
+                        "max_matches": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Default 100 matches (200 files when listing)." }
+                    }
                 },
                 "annotations": read_only,
             }),
@@ -172,7 +209,7 @@ impl Server {
             tools.push(json!({
                 "name": "edit_many",
                 "title": "Edit many",
-                "description": "Apply several exact-string replacements across one or more files in a single call. Every edit is validated before any file is written. Each file must have been read with read_many in this session and be unchanged since. Each old_string must match exactly once unless replace_all is true.",
+                "description": "Change files in one call: exact-string replacements across one or more files, new files, and full rewrites. Batch every edit you have ready into one call. Every edit is validated before any file is written. An existing file must have been read with read_many in this session; if it changed since (a formatter, a script), edits still apply when old_string matches exactly. Each old_string must match exactly once unless replace_all is true. To create a file, omit old_string. To replace a whole file, set overwrite. The reply says where each edit landed, so there is no need to re-read a file to check an edit.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -182,11 +219,12 @@ impl Server {
                                 "type": "object",
                                 "properties": {
                                     "path": { "type": "string" },
-                                    "old_string": { "type": "string" },
+                                    "old_string": { "type": "string", "description": "Exact text to replace. Omit to create a new file." },
                                     "new_string": { "type": "string" },
-                                    "replace_all": { "type": "boolean" }
+                                    "replace_all": { "type": "boolean" },
+                                    "overwrite": { "type": "boolean", "description": "Replace the whole file with new_string." }
                                 },
-                                "required": ["path", "old_string", "new_string"]
+                                "required": ["path", "new_string"]
                             }
                         }
                     },

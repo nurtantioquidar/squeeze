@@ -112,6 +112,14 @@ struct RunArgs {
     /// Also expose the edit_many tool (Claude Code asks before each use)
     #[arg(long)]
     edit_tool: bool,
+    /// Let squeeze's tools replace Claude Code's Read, Edit, Write, Grep and Glob, with
+    /// guidance on using them (implies --edit-tool). Read can no longer show images or PDFs.
+    #[arg(long, conflicts_with = "no_mcp")]
+    replace_file_tools: bool,
+    /// Turn off built-in tools a coding session rarely needs (Workflow, ScheduleWakeup,
+    /// ReportFindings, ListAgents): each is sent in full with every request
+    #[arg(long)]
+    trim_tools: bool,
     /// With --proxy: Claude Code authenticates through an apiKeyHelper in your settings
     #[arg(long)]
     api_key_helper: bool,
@@ -439,11 +447,24 @@ async fn cmd_run(a: RunArgs) -> Result<i32> {
     if settings.as_object().is_some_and(|m| !m.is_empty()) {
         merge_settings_arg(&mut args, settings)?;
     }
+    // Appended after the user's arguments: --disallowedTools and --mcp-config are
+    // variadic and would otherwise swallow a trailing prompt.
+    let mut off: Vec<&str> = Vec::new();
+    if a.replace_file_tools {
+        off.extend(squeeze::mcp::REPLACED_BUILTINS);
+        args.push("--append-system-prompt".into());
+        args.push(squeeze::mcp::FILE_TOOLS_GUIDE.into());
+    }
+    if a.trim_tools {
+        off.extend(squeeze::mcp::TRIMMED_BUILTINS);
+    }
+    if !off.is_empty() {
+        args.push("--disallowedTools".into());
+        args.extend(off.iter().map(|s| s.to_string()));
+    }
     if !a.no_mcp {
-        // Appended after the user's arguments: --mcp-config is variadic and would
-        // otherwise swallow a trailing prompt.
         args.push("--mcp-config".into());
-        args.push(mcp_config(&store, &std::env::current_dir()?, a.edit_tool)?);
+        args.push(mcp_config(&store, &std::env::current_dir()?, a.edit_tool || a.replace_file_tools)?);
     }
     cmd.args(&args).env("SQUEEZE_HOME", store.root());
     let mut child = cmd.spawn().with_context(|| format!("could not start `{}`", a.claude_bin))?;

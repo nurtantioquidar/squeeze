@@ -395,12 +395,14 @@ async fn session_inner(
         .clone()
         .or_else(|| d.allowed_tools.clone())
         .unwrap_or_else(|| bench::DEFAULT_TOOLS.iter().map(|s| s.to_string()).collect());
-    if arm.uses_mcp() {
-        tools.extend(bench::squeeze_tool_names());
+    tools.extend(arm.tool_names());
+    let mut mcp_args = vec!["mcp".to_string(), "--root".into(), bundle.workdir.clone()];
+    if arm.replaces_file_tools() {
+        mcp_args.push("--edit-tool".into());
     }
     let mcp = if arm.uses_mcp() {
         json!({ "mcpServers": { "squeeze": {
-            "type": "stdio", "command": exe, "args": ["mcp", "--root", bundle.workdir], "env": { "SQUEEZE_HOME": AGENT_STORE },
+            "type": "stdio", "command": exe, "args": mcp_args, "env": { "SQUEEZE_HOME": AGENT_STORE },
             "alwaysLoad": true
         }}})
         .to_string()
@@ -410,7 +412,7 @@ async fn session_inner(
     let settings = if arm.uses_hook() {
         Some(crate::hook::session_settings(&exe, arm.uses_mcp()))
     } else if arm.uses_mcp() {
-        Some(json!({ "permissions": { "allow": bench::squeeze_tool_names() } }))
+        Some(json!({ "permissions": { "allow": arm.tool_names() } }))
     } else {
         None
     };
@@ -431,8 +433,10 @@ async fn session_inner(
         if let Some(s) = &settings {
             a.extend(["--settings".into(), s.to_string()]);
         }
+        a.extend(arm.extra_args());
         // As in SessionBench: no todo or ask-user tools; no web lookups of solutions.
         a.extend(["--disallowedTools", "TodoWrite", "AskUserQuestion", "WebFetch", "WebSearch"].map(String::from));
+        a.extend(arm.disallowed_tools());
         a.extend([if resume { "--resume" } else { "--session-id" }.to_string(), sid.clone()]);
         a.push("--allowedTools".into()); // variadic: keep last
         a.extend(tools.iter().cloned());

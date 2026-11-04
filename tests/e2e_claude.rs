@@ -371,7 +371,7 @@ rubric = "anything"
             .arg(&tasks)
             .args(["--auth", "api-key", "--repeats", "1", "--yes", "--claude-bin", &claude, "--out"])
             .arg(&results)
-            .args(["--arms", "vanilla,squeeze,squeeze-hook,squeeze-mcp,squeeze-proxy"])
+            .args(["--arms", "vanilla,squeeze,squeeze-full,squeeze-hook,squeeze-mcp,squeeze-proxy"])
             .args(extra)
             .env("ANTHROPIC_API_KEY", FAKE_KEY)
             .env("ANTHROPIC_BASE_URL", mock.url())
@@ -390,7 +390,7 @@ rubric = "anything"
 
     let rows: Vec<Value> =
         std::fs::read_to_string(&results).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(rows.len(), 5, "one session per arm");
+    assert_eq!(rows.len(), 6, "one session per arm");
     let mut pushbacks = 0;
     for r in &rows {
         assert!(r["error"].is_null(), "{r}");
@@ -418,7 +418,18 @@ rubric = "anything"
         .filter_map(|b| tool_result_text(b, "toolu_mock_bash1"))
         .filter(|t| t.contains("[squeeze: output compressed"))
         .count();
-    assert!(compressed >= 3, "expected compression in squeeze, squeeze-hook and squeeze-proxy arms");
+    assert!(compressed >= 4, "expected compression in squeeze, squeeze-full, squeeze-hook and squeeze-proxy arms");
+    // squeeze-full: the built-in file tools are gone and edit_many is offered.
+    let full: Vec<&Value> = reqs
+        .iter()
+        .filter(|b| is_main_thread(b) && b["system"].to_string().contains("turned off in this session"))
+        .collect();
+    assert!(!full.is_empty(), "squeeze-full sessions carry the guidance");
+    for b in full {
+        let names: Vec<&str> = b["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(!names.contains(&"Read") && !names.contains(&"Edit"), "{names:?}");
+        assert!(names.contains(&"mcp__squeeze__edit_many"), "{names:?}");
+    }
     assert!(stdout.contains("cost vs vanilla"));
 
     // Rerunning with the same results file resumes: nothing left to do.
@@ -573,4 +584,98 @@ async fn hook_events_for_failing_bash() {
 
 fn crate_trunc(s: &str) -> String {
     s.chars().take(160).collect()
+}
+
+/// The fixed "model" for --replace-file-tools: read with read_many, then edit one
+/// file and create another in a single edit_many call, then finish.
+fn full_tools_script(r: &Recorded) -> Reply {
+    if r.path != "/v1/messages" {
+        return script(r);
+    }
+    let body = r.json();
+    if !is_main_thread(&body) {
+        return Reply::Sse(sse_text(99, "ok"));
+    }
+    let n = assistant_turns(&body);
+    match n {
+        0 => {
+            Reply::Sse(sse_tool_use(n, "toolu_full_read", "mcp__squeeze__read_many", json!({ "files": ["hello.txt"] })))
+        }
+        1 => Reply::Sse(sse_tool_use(
+            n,
+            "toolu_full_edit",
+            "mcp__squeeze__edit_many",
+            json!({ "edits": [
+                { "path": "hello.txt", "old_string": "hello", "new_string": "goodbye" },
+                { "path": "src/new.txt", "new_string": "created by edit_many\n" }
+            ] }),
+        )),
+        _ => Reply::Sse(sse_text(n, "done")),
+    }
+}
+
+/// `squeeze run --replace-file-tools`: Claude Code's file tools are gone, squeeze's
+/// read and edit tools are sent in full with guidance, and edits land on disk.
+#[tokio::test]
+#[ignore = "needs the claude CLI; run with --ignored"]
+async fn squeeze_run_replace_file_tools() {
+    let claude = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("hello.txt"), "hello from squeeze\n").unwrap();
+    let mock = common::start(Arc::new(full_tools_script)).await;
+
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_squeeze"))
+        .current_dir(&work)
+        .args(["run", "--quiet", "--replace-file-tools", "--trim-tools", "--claude-bin", &claude, "--"])
+        .args(["-p", "Change hello to goodbye and add src/new.txt.", "--output-format", "json"])
+        // edit_many asks before each use, like Edit; a script pre-approves it.
+        .args(["--model", "claude-mock", "--allowedTools", "Bash", "mcp__squeeze__edit_many", "--strict-mcp-config"])
+        .env("ANTHROPIC_BASE_URL", mock.url())
+        .env("ANTHROPIC_API_KEY", FAKE_KEY)
+        .env("ENABLE_TOOL_SEARCH", "true")
+        .env("SQUEEZE_HOME", tmp.path().join("squeeze-home"))
+        .env("CLAUDE_CONFIG_DIR", tmp.path().join("claude-config"))
+        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+        .env("DISABLE_AUTOUPDATER", "1")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .stdin(Stdio::null())
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(180), out).await.expect("timed out").unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "squeeze run failed\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: Value = serde_json::from_str(stdout.trim()).expect("claude JSON output");
+    assert_eq!(result["result"], "done", "{result}");
+    assert_eq!(result["permission_denials"], json!([]), "{result}");
+
+    let main: Vec<Value> = mock
+        .requests()
+        .iter()
+        .filter(|r| r.path == "/v1/messages")
+        .map(Recorded::json)
+        .filter(is_main_thread)
+        .collect();
+    let first = main.iter().find(|b| assistant_turns(b) == 0).unwrap();
+    let names: Vec<&str> = first["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    for builtin in ["Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit", "Workflow", "ScheduleWakeup", "ListAgents"]
+    {
+        assert!(!names.contains(&builtin), "{builtin} should be turned off: {names:?}");
+    }
+    for tool in ["mcp__squeeze__read_many", "mcp__squeeze__edit_many", "mcp__squeeze__search"] {
+        assert!(names.contains(&tool), "{tool} not sent in full: {names:?}");
+    }
+    assert!(first["system"].to_string().contains("turned off in this session"), "guidance in the system prompt");
+
+    let last = main.iter().max_by_key(|b| assistant_turns(b)).unwrap();
+    let edit = tool_result_text(last, "toolu_full_edit").unwrap();
+    assert!(edit.contains("hello.txt: 1 edit(s) applied at line(s) 1"), "{edit}");
+    assert!(edit.contains("src/new.txt: created (1 lines)"), "{edit}");
+    assert_eq!(std::fs::read_to_string(work.join("hello.txt")).unwrap(), "goodbye from squeeze\n");
+    assert_eq!(std::fs::read_to_string(work.join("src/new.txt")).unwrap(), "created by edit_many\n");
 }
