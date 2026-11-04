@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_SEARCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_OUTPUT_CHARS: usize = 250_000;
+/// Per-call output budget, under Claude Code's default MCP result limit
+/// (MAX_MCP_OUTPUT_TOKENS = 25,000 tokens, about 100,000 characters): past it,
+/// Claude Code truncates the result or moves it to a file.
+const MAX_OUTPUT_CHARS: usize = 80_000;
 const MAX_LINE_CHARS: usize = 2000;
 
 pub struct Workspace {
@@ -56,26 +59,34 @@ impl Workspace {
     }
 
     /// Resolve a path for a file that may not exist yet: its nearest existing
-    /// ancestor must be inside the root, and the rest may not contain `..`.
+    /// ancestor must be a directory inside the root, and the rest may not
+    /// contain `..`. An existing entry that can't be resolved (a dangling or
+    /// looping symlink) is refused: writing through it could land anywhere.
     fn resolve_new(&self, path: &str) -> Result<PathBuf> {
         if let Ok(p) = self.resolve(path) {
             return Ok(p);
         }
         let p = Path::new(path);
         let joined = if p.is_absolute() { p.to_path_buf() } else { self.root.join(p) };
+        if joined.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            bail!("{path}: `..` is not allowed in a new file's path");
+        }
         let mut base = joined.as_path();
         let mut rest = Vec::new();
-        while !base.exists() {
+        // symlink_metadata, unlike exists(), sees a symlink whose target is missing.
+        while fs::symlink_metadata(base).is_err() {
             let name = base.file_name().with_context(|| format!("{path}: invalid path"))?;
             rest.push(name.to_os_string());
             base = base.parent().with_context(|| format!("{path}: invalid path"))?;
         }
-        if joined.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-            bail!("{path}: `..` is not allowed in a new file's path");
-        }
-        let mut canon = base.canonicalize()?;
+        let mut canon = base
+            .canonicalize()
+            .map_err(|_| anyhow!("{path}: {} is a symlink whose target does not exist", self.display(base)))?;
         if !self.allow_outside_root && !canon.starts_with(&self.root) {
             bail!("{path}: outside the project root {}", self.root.display());
+        }
+        if !canon.is_dir() {
+            bail!("{path}: {} is not a directory", self.display(&canon));
         }
         for part in rest.into_iter().rev() {
             canon.push(part);
@@ -114,18 +125,21 @@ impl Workspace {
                     arg_usize(f, "limit").unwrap_or(2000).clamp(1, 5000),
                 ),
             };
-            if out.len() > MAX_OUTPUT_CHARS {
+            let budget = MAX_OUTPUT_CHARS.saturating_sub(out.len());
+            if budget < 500 {
+                let rest: Vec<&str> =
+                    files[n..].iter().map(|f| f.as_str().or_else(|| arg_str(f, "path")).unwrap_or("?")).collect();
                 let _ = writeln!(
                     out,
-                    "[squeeze: output budget reached; {} file(s) not shown, request them separately]",
-                    files.len() - n
+                    "[squeeze: output budget reached; not shown, request separately: {}]",
+                    rest.join(", ")
                 );
                 break;
             }
             if n > 0 {
                 out.push('\n');
             }
-            match self.read_one(path, offset, limit) {
+            match self.read_one(path, offset, limit, budget) {
                 Ok(s) => out.push_str(&s),
                 Err(e) => {
                     let _ = writeln!(out, "==> {path} <==\n[error: {e}]");
@@ -135,7 +149,7 @@ impl Workspace {
         Ok(out)
     }
 
-    fn read_one(&mut self, path: &str, offset: usize, limit: usize) -> Result<String> {
+    fn read_one(&mut self, path: &str, offset: usize, limit: usize, budget: usize) -> Result<String> {
         let canon = self.resolve(path)?;
         if canon.is_dir() {
             bail!("is a directory");
@@ -153,11 +167,20 @@ impl Workspace {
         }
         let start = (offset - 1).min(lines.len());
         let end = (start + limit).min(lines.len());
-        let mut out = format!("==> {shown} (lines {}-{} of {}) <==\n", start + 1, end, lines.len());
+        let mut body = String::new();
+        let mut shown_to = start;
         for (i, line) in lines[start..end].iter().enumerate() {
-            let _ = writeln!(out, "{}\t{}", start + i + 1, truncate_chars(line, MAX_LINE_CHARS));
+            let entry = format!("{}\t{}\n", start + i + 1, truncate_chars(line, MAX_LINE_CHARS));
+            if body.len() + entry.len() > budget {
+                break;
+            }
+            body.push_str(&entry);
+            shown_to = start + i + 1;
         }
-        if end < lines.len() {
+        let mut out = format!("==> {shown} (lines {}-{} of {}) <==\n{body}", start + 1, shown_to, lines.len());
+        if shown_to < end {
+            let _ = writeln!(out, "[squeeze: output budget reached; use offset {} to continue]", shown_to + 1);
+        } else if end < lines.len() {
             let _ = writeln!(out, "[squeeze: {} more lines; use offset {} to continue]", lines.len() - end, end + 1);
         }
         Ok(out)
@@ -222,18 +245,16 @@ impl Workspace {
             .size_limit(10 << 20)
             .build()
             .with_context(|| format!("invalid regex {pattern:?}"))?;
-        let (base, walk) = self.walker(args)?;
+        let (base, files) = self.walk_files(args)?;
 
         let mut out = String::new();
         let (mut shown, mut total, mut files_with) = (0usize, 0usize, 0usize);
-        for entry in walk.flatten() {
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
+        let mut over_budget = false;
+        for path in &files {
+            if fs::metadata(path).map_or(true, |m| m.len() > MAX_SEARCH_FILE_BYTES) {
                 continue;
             }
-            if entry.metadata().map_or(true, |m| m.len() > MAX_SEARCH_FILE_BYTES) {
-                continue;
-            }
-            let Ok(bytes) = fs::read(entry.path()) else { continue };
+            let Ok(bytes) = fs::read(path) else { continue };
             if is_binary(&bytes) {
                 continue;
             }
@@ -245,18 +266,22 @@ impl Workspace {
             }
             files_with += 1;
             total += hits.len();
-            if shown >= max {
+            if shown >= max || over_budget {
+                continue;
+            }
+            if out.len() > MAX_OUTPUT_CHARS {
+                over_budget = true;
                 continue;
             }
             if files_only {
                 shown += 1;
-                let _ = writeln!(out, "{} ({} matches)", self.display(entry.path()), hits.len());
+                let _ = writeln!(out, "{} ({} matches)", self.display(path), hits.len());
                 continue;
             }
             let take: Vec<usize> = hits.iter().copied().take(max - shown).collect();
             shown += take.len();
             let hit_set: HashSet<usize> = take.iter().copied().collect();
-            let _ = writeln!(out, "{}", self.display(entry.path()));
+            let _ = writeln!(out, "{}", self.display(path));
             let mut printed_to: Option<usize> = None;
             for &h in &take {
                 let start = h.saturating_sub(ctx);
@@ -279,7 +304,9 @@ impl Workspace {
             return Ok(format!("No matches for /{pattern}/ under {}.", self.display(&base)));
         }
         let _ = write!(out, "{total} matches in {files_with} files");
-        if files_only && files_with > shown {
+        if over_budget {
+            let _ = write!(out, " (output budget reached after {shown}; narrow the pattern, path or glob to see more)");
+        } else if files_only && files_with > shown {
             let _ = write!(out, " (listing the first {shown} files)");
         } else if !files_only && total > shown {
             let _ = write!(out, " (showing the first {shown}; narrow the pattern, path or glob to see more)");
@@ -288,33 +315,46 @@ impl Workspace {
         Ok(out)
     }
 
-    /// A gitignore-aware walk under `path`, filtered by `glob`.
-    fn walker(&self, args: &Value) -> Result<(PathBuf, ignore::Walk)> {
+    /// Files under `path`, as Claude Code's Grep and Glob see them: .gitignore
+    /// honored, dotfiles included, version-control directories skipped. `glob`
+    /// is relative to the project root, and one without `/` matches file names
+    /// at any depth.
+    fn walk_files(&self, args: &Value) -> Result<(PathBuf, Vec<PathBuf>)> {
         let base = self.resolve(arg_str(args, "path").unwrap_or("."))?;
+        let glob = match arg_str(args, "glob").filter(|g| !g.is_empty()) {
+            Some(g) => {
+                let anchor = if base.starts_with(&self.root) { self.root.as_path() } else { base.as_path() };
+                let mut ob = OverrideBuilder::new(anchor);
+                ob.add(g).with_context(|| format!("invalid glob {g:?}"))?;
+                Some(ob.build()?)
+            }
+            None => None,
+        };
         let mut wb = WalkBuilder::new(&base);
-        wb.sort_by_file_name(|a, b| a.cmp(b)).require_git(false);
-        if let Some(glob) = arg_str(args, "glob") {
-            let mut ob = OverrideBuilder::new(&base);
-            ob.add(glob).with_context(|| format!("invalid glob {glob:?}"))?;
-            wb.overrides(ob.build()?);
-        }
-        Ok((base, wb.build()))
+        wb.sort_by_file_name(|a, b| a.cmp(b)).require_git(false).hidden(false).filter_entry(|e| {
+            !(e.file_type().is_some_and(|t| t.is_dir())
+                && matches!(e.file_name().to_str(), Some(".git" | ".hg" | ".svn" | ".jj" | ".bzr" | ".sl")))
+        });
+        let files = wb
+            .build()
+            .flatten()
+            .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+            .map(ignore::DirEntry::into_path)
+            // Matched against files only: as a walker override, a glob that
+            // matched a directory name would let it past .gitignore.
+            .filter(|p| glob.as_ref().is_none_or(|ov| !ov.matched(p, false).is_ignore()))
+            .collect();
+        Ok((base, files))
     }
 
     /// `search` without a pattern: list files (like `find`/`ls -R`), honoring .gitignore.
     fn list_files(&self, args: &Value) -> Result<String> {
-        let max = arg_usize(args, "max_matches").unwrap_or(200).clamp(1, 2000);
-        let (base, walk) = self.walker(args)?;
+        let max = arg_usize(args, "max_matches").unwrap_or(200).clamp(1, 1000);
+        let (base, files) = self.walk_files(args)?;
         let mut out = String::new();
-        let mut total = 0usize;
-        for entry in walk.flatten() {
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
-            total += 1;
-            if total <= max {
-                let _ = writeln!(out, "{}", self.display(entry.path()));
-            }
+        let total = files.len();
+        for path in files.iter().take(max) {
+            let _ = writeln!(out, "{}", self.display(path));
         }
         if total == 0 {
             return Ok(format!("No files under {}.", self.display(&base)));
@@ -379,31 +419,54 @@ impl Workspace {
             }
             by_path.entry(canon).or_default().push(edit);
         }
+        // On a case-insensitive volume (macOS by default) two spellings of one new
+        // file would both be "created" and the second would replace the first.
+        let mut new_names = HashSet::new();
+        for path in order.iter().filter(|p| !p.exists()) {
+            if !new_names.insert(path.to_string_lossy().to_lowercase()) {
+                bail!("{}: the same new file appears twice with different capitalization", self.display(path));
+            }
+        }
 
-        // (path, new content, existed, what was done)
-        let mut staged: Vec<(PathBuf, String, bool, String)> = Vec::new();
+        struct Staged {
+            path: PathBuf,
+            text: String,
+            existed: bool,
+            stale: bool,
+            what: String,
+        }
+        let mut staged: Vec<Staged> = Vec::new();
         for path in &order {
             let shown = self.display(path);
             let existed = path.exists();
-            let (mut text, mut note) = if existed {
+            let (mut text, stale) = if existed {
                 let bytes = self.load(path)?;
                 let stale = match self.reads.get(path) {
                     None => bail!("{shown}: read it with read_many before editing it"),
                     Some(h) => *h != blake3::hash(&bytes),
                 };
-                let text = String::from_utf8(bytes).map_err(|_| anyhow!("{shown}: not valid UTF-8"))?;
-                (text, if stale { " (the file had changed since you read it; matched exactly)" } else { "" })
+                (String::from_utf8(bytes).map_err(|_| anyhow!("{shown}: not valid UTF-8"))?, stale)
             } else {
-                (String::new(), "")
+                (String::new(), false)
             };
-            let mut lines = Vec::new();
+            let changed = if stale { "; the file changed since you read it, so read it again" } else { "" };
+            // Byte offset and length of each replacement in the current text, kept
+            // up to date as later edits shift them, for the line numbers reported.
+            let mut spots: Vec<(usize, usize)> = Vec::new();
             let mut action = None;
             for (i, e) in by_path[path].iter().enumerate() {
                 let n = i + 1;
-                if e.overwrite || (e.old.is_empty() && !existed && i == 0) {
+                if e.overwrite || (e.old.is_empty() && !existed) {
+                    if i > 0 {
+                        bail!(
+                            "{shown}: edit {n} of this file: a new file or overwrite must be the first edit of its file"
+                        );
+                    }
+                    if stale {
+                        bail!("{shown}: the file changed since you read it; read it again before overwriting it");
+                    }
                     text = e.new.to_string();
                     action = Some(if existed { "rewritten" } else { "created" });
-                    note = "";
                     continue;
                 }
                 if e.old.is_empty() {
@@ -411,59 +474,102 @@ impl Workspace {
                         "{shown}: edit {n} of this file: `old_string` is empty; set overwrite to replace the whole file"
                     );
                 }
-                let count = text.matches(e.old).count();
-                if count == 0 {
-                    bail!("{shown}: edit {n} of this file: old_string not found");
+                if e.all && stale {
+                    bail!("{shown}: the file changed since you read it; read it again before using replace_all");
                 }
-                if count > 1 && !e.all {
+                let at: Vec<usize> = text.match_indices(e.old).map(|(k, _)| k).collect();
+                if at.is_empty() {
+                    bail!("{shown}: edit {n} of this file: old_string not found{changed}");
+                }
+                if at.len() > 1 && !e.all {
                     bail!(
-                        "{shown}: edit {n} of this file: old_string matches {count} times; add surrounding context or set replace_all"
+                        "{shown}: edit {n} of this file: old_string matches {} times; add surrounding context or set replace_all{changed}",
+                        at.len()
                     );
                 }
-                let at = text.find(e.old).expect("counted above");
-                lines.push(text[..at].matches('\n').count() + 1);
+                let delta = e.new.len() as isize - e.old.len() as isize;
+                for spot in &mut spots {
+                    let before = at.iter().filter(|&&k| k < spot.0).count() as isize;
+                    spot.0 = (spot.0 as isize + before * delta) as usize;
+                }
+                for (j, &k) in at.iter().enumerate() {
+                    spots.push(((k as isize + j as isize * delta) as usize, e.new.len()));
+                }
                 text = if e.all { text.replace(e.old, e.new) } else { text.replacen(e.old, e.new, 1) };
             }
             let mut what = match action {
                 Some(a) => format!("{a} ({} lines)", text.lines().count()),
                 None => String::new(),
             };
-            if !lines.is_empty() {
+            if !spots.is_empty() {
+                let bytes = text.as_bytes();
+                let mut lines: Vec<usize> =
+                    spots.iter().map(|&(k, _)| bytecount_newlines(&bytes[..k.min(bytes.len())]) + 1).collect();
+                lines.sort_unstable();
                 let at: Vec<String> = lines.iter().map(usize::to_string).collect();
                 if !what.is_empty() {
                     what.push_str(", then ");
                 }
-                let _ = write!(what, "{} edit(s) applied at line(s) {}", lines.len(), at.join(", "));
+                let _ = write!(what, "{} replacement(s) at line(s) {}", lines.len(), at.join(", "));
             }
-            what.push_str(note);
-            staged.push((path.clone(), text, existed, what));
+            if stale {
+                what.push_str(" (the file had changed since you read it; matched exactly)");
+            }
+            staged.push(Staged { path: path.clone(), text, existed, stale, what });
         }
 
+        // Write everything to temporary files next to their targets first, and
+        // move them into place only once all of them were written.
+        let mut temps = Vec::new();
+        for st in &staged {
+            let shown = self.display(&st.path);
+            let dir = st.path.parent().with_context(|| format!("{shown}: invalid path"))?;
+            fs::create_dir_all(dir).with_context(|| format!("{shown}: could not create its directory"))?;
+            temps.push(
+                write_temp(&st.path, st.existed, st.text.as_bytes())
+                    .with_context(|| format!("{shown}: write failed"))?,
+            );
+        }
         let mut out = String::new();
-        for (path, text, existed, what) in staged {
-            if existed {
-                write_preserving_permissions(&path, text.as_bytes())?;
+        for (st, tmp) in staged.into_iter().zip(temps) {
+            let shown = self.display(&st.path);
+            // A rename replaces a symlink at the target instead of following it; a
+            // new file must still not exist (no clobbering a file created meanwhile).
+            let moved = if st.existed {
+                tmp.persist(&st.path).map(|_| ())
             } else {
-                if let Some(dir) = path.parent() {
-                    fs::create_dir_all(dir)?;
-                }
-                fs::write(&path, text.as_bytes())?;
+                tmp.persist_noclobber(&st.path).map(|_| ())
+            };
+            if let Err(e) = moved {
+                bail!("{shown}: could not be written ({}); already written:\n{out}", e.error);
             }
-            self.reads.insert(path.clone(), blake3::hash(text.as_bytes()));
-            let _ = writeln!(out, "{}: {what}", self.display(&path));
+            // After a stale edit the agent still hasn't seen the whole file.
+            if !st.stale {
+                self.reads.insert(st.path.clone(), blake3::hash(st.text.as_bytes()));
+            }
+            let _ = writeln!(out, "{shown}: {}", st.what);
         }
         Ok(out)
     }
 }
 
-fn write_preserving_permissions(path: &Path, data: &[u8]) -> Result<()> {
-    let perms = fs::metadata(path)?.permissions();
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = path.with_file_name(format!(".{name}.squeeze-tmp"));
-    fs::write(&tmp, data)?;
-    fs::set_permissions(&tmp, perms)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+fn bytecount_newlines(b: &[u8]) -> usize {
+    b.iter().filter(|&&c| c == b'\n').count()
+}
+
+/// A temporary file next to `path` holding `data`, with `path`'s permissions
+/// (or the usual 0644 for a new file). Created exclusively, so it never
+/// follows a symlink that happens to sit at the temporary name.
+fn write_temp(path: &Path, existed: bool, data: &[u8]) -> Result<tempfile::NamedTempFile> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = path.parent().context("invalid path")?;
+    let mut tmp = tempfile::Builder::new().prefix(".squeeze-edit-").tempfile_in(dir)?;
+    tmp.write_all(data)?;
+    tmp.flush()?;
+    let perms = if existed { fs::metadata(path)?.permissions() } else { fs::Permissions::from_mode(0o644) };
+    fs::set_permissions(tmp.path(), perms)?;
+    Ok(tmp)
 }
 
 #[cfg(test)]
@@ -528,7 +634,7 @@ mod tests {
         assert!(fs::read_to_string(&a).unwrap().contains("let x = 1;"));
 
         let out = ws.edit_many(&edit).unwrap();
-        assert_eq!(out, "src/a.rs: 1 edit(s) applied at line(s) 2\n");
+        assert_eq!(out, "src/a.rs: 1 replacement(s) at line(s) 2\n");
         assert!(fs::read_to_string(&a).unwrap().contains("let x = 2;"));
 
         // Changed since the read (say, by a formatter): applied by exact match, with a note.
@@ -548,7 +654,7 @@ mod tests {
                 { "path": "src/new/mod.rs", "old_string": "f()", "new_string": "g()" }
             ] }))
             .unwrap();
-        assert_eq!(out, "src/new/mod.rs: created (1 lines), then 1 edit(s) applied at line(s) 1\n");
+        assert_eq!(out, "src/new/mod.rs: created (1 lines), then 1 replacement(s) at line(s) 1\n");
         assert_eq!(fs::read_to_string(d.path().join("proj/src/new/mod.rs")).unwrap(), "pub fn g() {}\n");
 
         // Existing files: empty old_string needs overwrite, and overwrite needs a read.
@@ -566,6 +672,112 @@ mod tests {
         let sneaky = json!({ "edits": [{ "path": "src/nope/../../../evil.txt", "new_string": "x" }] });
         assert!(ws.edit_many(&sneaky).is_err());
         assert!(!d.path().join("evil.txt").exists());
+    }
+
+    #[test]
+    fn edit_many_never_writes_outside_the_root() {
+        let (d, mut ws) = setup();
+        let outside = d.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        // Dangling symlinks inside the root, absolute and relative, pointing outside it.
+        std::os::unix::fs::symlink(outside.join("pwned.txt"), d.path().join("proj/notes.md")).unwrap();
+        std::os::unix::fs::symlink("../../outside/rel.txt", d.path().join("proj/src/rel.md")).unwrap();
+        for p in ["notes.md", "src/rel.md"] {
+            let err = ws.edit_many(&json!({ "edits": [{ "path": p, "new_string": "owned\n" }] })).unwrap_err();
+            assert!(err.to_string().contains("symlink whose target does not exist"), "{p}: {err}");
+        }
+        assert!(!outside.join("pwned.txt").exists() && !outside.join("rel.txt").exists());
+        // A new file under an existing file is refused before anything is written.
+        ws.read_many(&json!({ "files": ["src/a.rs"] })).unwrap();
+        let mixed = json!({ "edits": [
+            { "path": "src/a.rs", "old_string": "let x = 1;", "new_string": "let x = 9;" },
+            { "path": "src/a.rs/oops.rs", "new_string": "x" }
+        ] });
+        assert!(ws.edit_many(&mixed).unwrap_err().to_string().contains("is not a directory"));
+        assert!(fs::read_to_string(d.path().join("proj/src/a.rs")).unwrap().contains("let x = 1;"), "nothing written");
+        // No temporary files are left behind.
+        let leftovers: Vec<_> = fs::read_dir(d.path().join("proj/src"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".squeeze-edit-"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn edit_many_refuses_blind_rewrites_of_changed_files() {
+        let (d, mut ws) = setup();
+        let a = d.path().join("proj/src/a.rs");
+        ws.read_many(&json!({ "files": ["src/a.rs"] })).unwrap();
+        fs::write(&a, "fn main() {\n    let x = 1;\n    let x = 1;\n}\n").unwrap(); // changed behind the agent's back
+        let overwrite = json!({ "edits": [{ "path": "src/a.rs", "new_string": "gone\n", "overwrite": true }] });
+        assert!(ws.edit_many(&overwrite).unwrap_err().to_string().contains("read it again before overwriting"));
+        let all = json!({ "edits": [{ "path": "src/a.rs", "old_string": "let x = 1;", "new_string": "y", "replace_all": true }] });
+        assert!(ws.edit_many(&all).unwrap_err().to_string().contains("read it again before using replace_all"));
+        let missing = json!({ "edits": [{ "path": "src/a.rs", "old_string": "nope", "new_string": "y" }] });
+        assert!(ws.edit_many(&missing).unwrap_err().to_string().contains("changed since you read it"));
+        // An exact match still applies, and the file stays "changed" for blind rewrites.
+        let one = json!({ "edits": [{ "path": "src/a.rs", "old_string": "fn main()", "new_string": "fn start()" }] });
+        assert!(ws.edit_many(&one).unwrap().contains("matched exactly"));
+        assert!(ws.edit_many(&overwrite).is_err());
+        assert!(fs::read_to_string(&a).unwrap().starts_with("fn start()"));
+    }
+
+    #[test]
+    fn edit_many_reports_final_line_numbers_and_rejects_bad_batches() {
+        let (d, mut ws) = setup();
+        fs::write(d.path().join("proj/src/l.txt"), "a\nb\nc\nb\n").unwrap();
+        ws.read_many(&json!({ "files": ["src/l.txt"] })).unwrap();
+        // The second edit adds a line above the first: the first is reported where it ends up.
+        let out = ws
+            .edit_many(&json!({ "edits": [
+                { "path": "src/l.txt", "old_string": "c", "new_string": "c1\nc2" },
+                { "path": "src/l.txt", "old_string": "a", "new_string": "a0\na1" },
+                { "path": "src/l.txt", "old_string": "b", "new_string": "B", "replace_all": true }
+            ] }))
+            .unwrap();
+        assert_eq!(out, "src/l.txt: 4 replacement(s) at line(s) 1, 3, 4, 6\n");
+        assert_eq!(fs::read_to_string(d.path().join("proj/src/l.txt")).unwrap(), "a0\na1\nB\nc1\nc2\nB\n");
+
+        let late = json!({ "edits": [
+            { "path": "src/l.txt", "old_string": "B", "new_string": "x", "replace_all": true },
+            { "path": "src/l.txt", "new_string": "all new\n", "overwrite": true }
+        ] });
+        assert!(ws.edit_many(&late).unwrap_err().to_string().contains("must be the first edit"));
+        let twice = json!({ "edits": [
+            { "path": "src/New.rs", "new_string": "1" },
+            { "path": "src/new.rs", "new_string": "2" }
+        ] });
+        assert!(ws.edit_many(&twice).unwrap_err().to_string().contains("different capitalization"));
+    }
+
+    #[test]
+    fn read_many_stays_within_the_output_budget() {
+        let (d, mut ws) = setup();
+        let big: String = (0..5000).map(|i| format!("line {i} {}\n", "x".repeat(40))).collect();
+        fs::write(d.path().join("proj/src/big.txt"), &big).unwrap();
+        let out = ws.read_many(&json!({ "files": ["src/big.txt", "src/a.rs"] })).unwrap();
+        assert!(out.len() <= MAX_OUTPUT_CHARS + 500, "{}", out.len());
+        assert!(out.contains("[squeeze: output budget reached; use offset"), "a cut file says where to continue");
+        assert!(out.contains("not shown, request separately: src/a.rs"), "and which files were left out");
+    }
+
+    #[test]
+    fn search_sees_dotfiles_and_keeps_globs_from_bypassing_gitignore() {
+        let (d, ws) = setup();
+        fs::create_dir_all(d.path().join("proj/.github/workflows")).unwrap();
+        fs::write(d.path().join("proj/.github/workflows/ci.yml"), "needle: true\n").unwrap();
+        fs::create_dir_all(d.path().join("proj/.git")).unwrap();
+        fs::write(d.path().join("proj/.git/config"), "needle").unwrap();
+        assert_eq!(ws.search(&json!({ "glob": "*.yml" })).unwrap(), ".github/workflows/ci.yml\n1 files\n");
+        let hits = ws.search(&json!({ "pattern": "needle", "files_only": true })).unwrap();
+        assert!(hits.contains(".github/workflows/ci.yml") && !hits.contains(".git/config"), "{hits}");
+        // "**/*" matches the gitignored target/ directory's name, but stays a file filter.
+        let all = ws.search(&json!({ "glob": "**/*" })).unwrap();
+        assert!(!all.contains("target/junk.rs") && !all.contains(".git/"), "{all}");
+        // Globs are relative to the project root even when path narrows the search.
+        let anchored = ws.search(&json!({ "path": "src", "glob": "src/*.rs" })).unwrap();
+        assert_eq!(anchored, "src/a.rs\n1 files\n");
     }
 
     #[test]

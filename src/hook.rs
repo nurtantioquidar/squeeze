@@ -96,6 +96,42 @@ pub fn run(stdin: &str, hint: ExpandHint) -> Option<String> {
     Some(reply.to_string())
 }
 
+/// The PreToolUse hook for squeeze's edit_many: approve it in the permission
+/// modes where Claude Code approves its own Edit without asking (acceptEdits,
+/// bypassPermissions). In any other mode it says nothing, so Claude Code asks.
+pub fn pre_tool_use(stdin: &str) -> Option<String> {
+    let input: Value = serde_json::from_str(stdin).ok()?;
+    if input.get("tool_name")?.as_str()? != EDIT_TOOL {
+        return None;
+    }
+    let mode = input.get("permission_mode")?.as_str()?;
+    matches!(mode, "acceptEdits" | "bypassPermissions").then(|| {
+        json!({ "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": format!("squeeze: {mode} accepts file edits"),
+        }})
+        .to_string()
+    })
+}
+
+const EDIT_TOOL: &str = "mcp__squeeze__edit_many";
+
+/// Add the PreToolUse hook that lets edit_many follow the permission mode as
+/// Edit does (see [`pre_tool_use`]) to session settings.
+pub fn add_edit_permission_hook(settings: &mut Value, exe: &Path) {
+    let command = format!("{} hook pre-tool-use", shell_quote(&exe.display().to_string()));
+    let entry = json!({ "matcher": EDIT_TOOL, "hooks": [{ "type": "command", "command": command, "timeout": 10 }] });
+    if !settings.is_object() {
+        *settings = json!({});
+    }
+    let hooks = settings.as_object_mut().expect("object").entry("hooks").or_insert_with(|| json!({}));
+    match hooks.get_mut("PreToolUse").and_then(Value::as_array_mut) {
+        Some(list) => list.push(entry),
+        None => hooks["PreToolUse"] = json!([entry]),
+    }
+}
+
 fn shell_quote(s: &str) -> String {
     if s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+:@".contains(c)) {
         s.to_string()
@@ -127,6 +163,23 @@ pub fn session_settings(exe: &Path, with_mcp: bool) -> Value {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn edit_many_follows_the_permission_mode() {
+        let input = |tool: &str, mode: &str| json!({ "tool_name": tool, "permission_mode": mode }).to_string();
+        for mode in ["acceptEdits", "bypassPermissions"] {
+            let reply: Value = serde_json::from_str(&pre_tool_use(&input(EDIT_TOOL, mode)).unwrap()).unwrap();
+            assert_eq!(reply["hookSpecificOutput"]["permissionDecision"], "allow");
+        }
+        assert!(pre_tool_use(&input(EDIT_TOOL, "default")).is_none(), "Claude Code asks, as for Edit");
+        assert!(pre_tool_use(&input(EDIT_TOOL, "plan")).is_none());
+        assert!(pre_tool_use(&input("Bash", "acceptEdits")).is_none(), "only edit_many");
+
+        let mut settings = session_settings(Path::new("/bin/squeeze"), true);
+        add_edit_permission_hook(&mut settings, Path::new("/bin/squeeze"));
+        assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], EDIT_TOOL);
+        assert!(settings["hooks"]["PostToolUse"].is_array(), "the compression hook stays");
+    }
 
     #[derive(Default)]
     struct Mem(HashMap<String, String>);

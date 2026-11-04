@@ -113,7 +113,16 @@ pub enum Arm {
     /// squeeze-full plus a scout: Explore redefined on the same model with
     /// squeeze's tools, and guidance to delegate broad investigation to it.
     SqueezeScout,
+    /// squeeze-full plus earlier compaction: Claude Code summarizes the
+    /// conversation once it nears [`COMPACT_WINDOW_TOKENS`] instead of near
+    /// the model's full window (`squeeze run --compact-window`).
+    SqueezeCompact,
 }
+
+/// The context window Claude Code is told to compact within in the
+/// squeeze-compact arm (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`). Claude Code keeps
+/// a summary buffer below it, so compaction starts near 100k tokens.
+pub const COMPACT_WINDOW_TOKENS: u64 = 130_000;
 
 impl Arm {
     pub fn name(self) -> &'static str {
@@ -125,17 +134,37 @@ impl Arm {
             Arm::SqueezeProxy => "squeeze-proxy",
             Arm::SqueezeFull => "squeeze-full",
             Arm::SqueezeScout => "squeeze-scout",
+            Arm::SqueezeCompact => "squeeze-compact",
         }
     }
     pub(crate) fn uses_mcp(self) -> bool {
-        matches!(self, Arm::Squeeze | Arm::SqueezeMcp | Arm::SqueezeProxy | Arm::SqueezeFull | Arm::SqueezeScout)
+        matches!(
+            self,
+            Arm::Squeeze
+                | Arm::SqueezeMcp
+                | Arm::SqueezeProxy
+                | Arm::SqueezeFull
+                | Arm::SqueezeScout
+                | Arm::SqueezeCompact
+        )
     }
     pub(crate) fn uses_hook(self) -> bool {
-        matches!(self, Arm::Squeeze | Arm::SqueezeHook | Arm::SqueezeFull | Arm::SqueezeScout)
+        matches!(self, Arm::Squeeze | Arm::SqueezeHook | Arm::SqueezeFull | Arm::SqueezeScout | Arm::SqueezeCompact)
     }
     /// squeeze's tools replace Claude Code's built-in file tools.
     pub(crate) fn replaces_file_tools(self) -> bool {
-        matches!(self, Arm::SqueezeFull | Arm::SqueezeScout)
+        matches!(self, Arm::SqueezeFull | Arm::SqueezeScout | Arm::SqueezeCompact)
+    }
+    /// Environment for the coding agent's Claude Code. Every arm runs without
+    /// background tasks: with them, `claude -p` can return while a background
+    /// command still runs, so its result misses the work that follows and the
+    /// simulated user reviews a reply written mid-task.
+    pub(crate) fn env(self) -> Vec<(&'static str, String)> {
+        let mut env = vec![("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1".to_string())];
+        if self == Arm::SqueezeCompact {
+            env.push(("CLAUDE_CODE_AUTO_COMPACT_WINDOW", COMPACT_WINDOW_TOKENS.to_string()));
+        }
+        env
     }
     /// squeeze tools this arm allows.
     pub(crate) fn tool_names(self) -> Vec<String> {
@@ -165,7 +194,7 @@ impl Arm {
             "--append-system-prompt".into(),
             format!("{FILE_TOOLS_GUIDE}\n\n{working}"),
             "--append-subagent-system-prompt".into(),
-            FILE_TOOLS_GUIDE.into(),
+            crate::mcp::SUBAGENT_FILE_TOOLS_GUIDE.into(),
         ];
         if scout {
             a.extend(["--agents".into(), crate::mcp::scout_agents_json()]);
@@ -185,9 +214,10 @@ impl std::str::FromStr for Arm {
             "squeeze-proxy" => Arm::SqueezeProxy,
             "squeeze-full" => Arm::SqueezeFull,
             "squeeze-scout" => Arm::SqueezeScout,
+            "squeeze-compact" => Arm::SqueezeCompact,
             other => {
                 bail!(
-                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-hook, squeeze-mcp, squeeze-proxy)"
+                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-compact, squeeze-hook, squeeze-mcp, squeeze-proxy)"
                 )
             }
         })
@@ -229,6 +259,34 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Take `modelUsage` from a `claude -p` result of a resumed session: every
+    /// model it used, subagents included (`usage` covers only the main agent
+    /// loop). Like `total_cost_usd`, `modelUsage` is a running total for the
+    /// whole session (it survives `--resume`), so it replaces, not adds.
+    pub(crate) fn set_model_usage(&mut self, r: &Value) {
+        let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+        self.invocations += 1;
+        self.turns += n(r, "num_turns");
+        self.duration_ms += n(r, "duration_ms");
+        if let Some(models) = r.get("modelUsage").and_then(Value::as_object) {
+            self.set_model_totals(models.values());
+        }
+    }
+
+    /// Replace cost and token totals with the sum over `models` (`modelUsage` values).
+    pub(crate) fn set_model_totals<'a>(&mut self, models: impl Iterator<Item = &'a Value>) {
+        let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+        (self.cost_usd, self.input_tokens, self.output_tokens) = (0.0, 0, 0);
+        (self.cache_read_input_tokens, self.cache_creation_input_tokens) = (0, 0);
+        for m in models {
+            self.cost_usd += m.get("costUSD").and_then(Value::as_f64).unwrap_or(0.0);
+            self.input_tokens += n(m, "inputTokens");
+            self.output_tokens += n(m, "outputTokens");
+            self.cache_read_input_tokens += n(m, "cacheReadInputTokens");
+            self.cache_creation_input_tokens += n(m, "cacheCreationInputTokens");
+        }
+    }
+
     pub(crate) fn add_result(&mut self, r: &Value) {
         let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
         self.cost_usd += r.get("total_cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
@@ -242,6 +300,14 @@ impl Usage {
             self.output_tokens += n(u, "output_tokens");
         }
     }
+}
+
+/// `TicketResult::excluded` for a ticket whose grading was deferred (`--defer-grading`).
+pub const GRADING_DEFERRED: &str = "grading deferred";
+
+/// An error recorded for a session stopped by a usage or rate limit.
+pub fn is_limit_error(e: &str) -> bool {
+    e.starts_with("usage or rate limit reached")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,15 +349,42 @@ pub struct SessionResult {
     pub hook_compressions: u64,
     #[serde(default)]
     pub hook_bytes_saved: u64,
-    /// Tool calls made by the agent, by tool name (from the session transcript).
+    /// Tool calls made by the agent, by tool name (from the session transcript);
+    /// a subagent's calls are counted as `subagent:<tool>`.
     #[serde(default)]
     pub tool_calls: BTreeMap<String, u64>,
+    /// Grading ran after the session instead of between its tickets.
+    #[serde(default)]
+    pub grading_deferred: bool,
+    /// The agent's usage summed over every model it used, subagents included
+    /// (`agent` holds the main agent loop's tokens; both carry Claude Code's cost).
+    #[serde(default)]
+    pub agent_all_models: Usage,
 }
 
 impl SessionResult {
-    /// Calls to squeeze's own MCP tools.
+    /// Calls to squeeze's own MCP tools, by the agent or its subagents.
     pub fn squeeze_tool_calls(&self) -> u64 {
-        self.tool_calls.iter().filter(|(k, _)| k.starts_with("mcp__squeeze__")).map(|(_, v)| v).sum()
+        self.tool_calls.iter().filter(|(k, _)| k.contains("mcp__squeeze__")).map(|(_, v)| v).sum()
+    }
+    /// Record one `claude -p` result of the coding agent. Its `total_cost_usd` is
+    /// the session's running total (Claude Code restores it on `--resume`), so the
+    /// cost is the latest total, never a sum; `usage`, turns and time are per call.
+    pub(crate) fn add_agent_result(&mut self, r: &Value) {
+        let before = self.agent.cost_usd;
+        self.agent.add_result(r);
+        if let Some(total) = r.get("total_cost_usd").and_then(Value::as_f64) {
+            self.agent.cost_usd = before.max(total);
+        }
+        self.agent_all_models.set_model_usage(r);
+    }
+    /// Tickets still waiting for `--regrade`.
+    pub fn awaiting_grading(&self) -> usize {
+        self.tickets.iter().filter(|t| t.excluded.as_deref() == Some(GRADING_DEFERRED)).count()
+    }
+    /// Finished without an error: its cost counts in comparisons.
+    pub fn counts(&self) -> bool {
+        self.completed && self.error.is_none()
     }
 }
 
@@ -363,10 +456,14 @@ pub(crate) async fn claude(
     prompt: &str,
     timeout: u64,
     base_url: Option<&str>,
+    env: &[(&str, String)],
 ) -> Result<Value> {
     let mut cmd = Command::new(&ctx.claude_bin);
     cmd.current_dir(cwd).args(args);
     apply_auth(&mut cmd, ctx);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     if let Some(url) = base_url {
         cmd.env("ANTHROPIC_BASE_URL", url);
     }
@@ -382,7 +479,7 @@ const HELPER_RETRY_PAUSE: Duration = if cfg!(test) { Duration::ZERO } else { Dur
 pub(crate) async fn helper(ctx: &Context, cwd: &Path, args: &[String], prompt: &str, timeout: u64) -> Result<Value> {
     let mut attempt = 0;
     loop {
-        match claude(ctx, cwd, args, prompt, timeout, None).await {
+        match claude(ctx, cwd, args, prompt, timeout, None, &[]).await {
             Err(e) if e.is::<NoResult>() && attempt < 2 => {
                 attempt += 1;
                 eprintln!("      helper claude exited without a result; retrying ({attempt}/2)");
@@ -520,6 +617,8 @@ pub async fn run_session(r: Run<'_>) -> Result<SessionResult> {
         hook_compressions: 0,
         hook_bytes_saved: 0,
         tool_calls: BTreeMap::new(),
+        grading_deferred: false,
+        agent_all_models: Usage::default(),
     };
     match session_inner(&r, model.as_deref(), &mut res).await {
         Ok(()) => res.completed = res.tickets.iter().all(|t| t.error.is_none()),
@@ -630,9 +729,10 @@ async fn session_inner(r: &Run<'_>, model: Option<&str>, res: &mut SessionResult
         let mut message = ticket.prompt.clone();
         let (mut passed, mut test_out) = (None, String::new());
         loop {
-            let result = claude(ctx, &work, &agent_args(started), &message, timeout, base_url.as_deref()).await?;
+            let result =
+                claude(ctx, &work, &agent_args(started), &message, timeout, base_url.as_deref(), &r.arm.env()).await?;
             started = true;
-            res.agent.add_result(&result);
+            res.add_agent_result(&result);
             let reply = result.get("result").and_then(Value::as_str).unwrap_or("").to_string();
             if result.get("is_error").and_then(Value::as_bool) == Some(true) {
                 tr.error = Some(crate::util::truncate_chars(&reply, 300));
@@ -727,25 +827,49 @@ pub(crate) fn record_activity_in(store_root: &Path, config: &Path, res: &mut Ses
         }
     }
     let name = format!("{}.jsonl", res.session_id);
-    let transcript = std::fs::read_dir(config.join("projects"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|d| d.path().join(&name))
-        .find(|p| p.exists());
-    let Some(text) = transcript.and_then(|p| std::fs::read_to_string(p).ok()) else { return };
-    let mut seen = HashSet::new();
-    for line in text.lines() {
-        let Ok(e) = serde_json::from_str::<Value>(line) else { continue };
-        if e.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            continue;
+    let project_dirs: Vec<PathBuf> =
+        std::fs::read_dir(config.join("projects")).into_iter().flatten().flatten().map(|d| d.path()).collect();
+    let Some(main) = project_dirs.iter().map(|d| d.join(&name)).find(|p| p.exists()) else { return };
+    // Subagent transcripts sit next to the session's, under <session id>/subagents/.
+    let mut files = vec![(main.clone(), false)];
+    if let Some(dir) = main.parent() {
+        let sub = dir.join(&res.session_id).join("subagents");
+        for f in std::fs::read_dir(sub).into_iter().flatten().flatten() {
+            if f.path().extension().is_some_and(|x| x == "jsonl") {
+                files.push((f.path(), true));
+            }
         }
-        for b in e.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
-            if b["type"] == "tool_use"
-                && let (Some(id), Some(name)) = (b["id"].as_str(), b["name"].as_str())
-                && seen.insert(id.to_string())
-            {
-                *res.tool_calls.entry(name.to_string()).or_default() += 1;
+    }
+    // Claude Code writes a cost snapshot (running totals) into the transcript at
+    // the end of each call; the last one is the session's cost.
+    if let Ok(text) = std::fs::read_to_string(&main)
+        && let Some(state) = text
+            .lines()
+            .rev()
+            .filter(|l| l.contains("\"cost-state\""))
+            .find_map(|l| serde_json::from_str::<Value>(l).ok().filter(|v| v["type"] == "cost-state"))
+    {
+        if let Some(total) = state.get("totalCostUSD").and_then(Value::as_f64) {
+            res.agent.cost_usd = total;
+        }
+        if let Some(models) = state.get("modelUsage").and_then(Value::as_object) {
+            res.agent_all_models.set_model_totals(models.values());
+        }
+    }
+    let mut seen = HashSet::new();
+    for (path, subagent_file) in files {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        for line in text.lines() {
+            let Ok(e) = serde_json::from_str::<Value>(line) else { continue };
+            let subagent = subagent_file || e.get("isSidechain").and_then(Value::as_bool) == Some(true);
+            for b in e.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
+                if b["type"] == "tool_use"
+                    && let (Some(id), Some(name)) = (b["id"].as_str(), b["name"].as_str())
+                    && seen.insert(id.to_string())
+                {
+                    let key = if subagent { format!("subagent:{name}") } else { name.to_string() };
+                    *res.tool_calls.entry(key).or_default() += 1;
+                }
             }
         }
     }
@@ -807,8 +931,9 @@ fn bootstrap_ratio(pairs: &[(f64, f64)]) -> Option<(f64, f64)> {
 }
 
 pub fn summarize(results: &[SessionResult]) -> String {
+    // Sessions that errored or didn't finish are left out of every mean and pair.
     let mut groups: BTreeMap<(String, Arm), Vec<&SessionResult>> = BTreeMap::new();
-    for r in results {
+    for r in results.iter().filter(|r| r.counts()) {
         groups.entry((r.bundle.clone(), r.arm)).or_default().push(r);
         groups.entry(("(all bundles)".into(), r.arm)).or_default().push(r);
     }
@@ -837,7 +962,8 @@ pub fn summarize(results: &[SessionResult]) -> String {
             .unwrap_or_default();
         for ((gb, arm), rs) in groups.iter().filter(|((gb, _), _)| *gb == b) {
             let costs: Vec<f64> = rs.iter().map(|r| r.agent.cost_usd).collect();
-            let rewards: Vec<f64> = rs.iter().map(|r| r.reward).collect();
+            // A session's reward counts once all its tickets are graded.
+            let rewards: Vec<f64> = rs.iter().filter(|r| r.awaiting_grading() == 0).map(|r| r.reward).collect();
             let turns: Vec<f64> = rs.iter().map(|r| r.agent.turns as f64).collect();
             let squeezed: Vec<f64> = rs.iter().map(|r| r.hook_compressions as f64).collect();
             let sq_tools: Vec<f64> = rs.iter().map(|r| r.squeeze_tool_calls() as f64).collect();
@@ -877,9 +1003,27 @@ pub fn summarize(results: &[SessionResult]) -> String {
         out,
         "\nsqueezed = outputs the hook compressed per session; sq tools = calls to squeeze's MCP tools per session.\n\
          agent $ is Claude Code's own list-price figure for the coding agent; on a subscription it measures usage,\n\
-         not a bill. Simulated user + judge used another ${helper:.4} (agent total ${agent:.4}). Sessions with errors: {}.",
-        results.iter().filter(|r| !r.completed).count()
+         not a bill. Agents used ${agent:.4} in all; simulated user + judge another ${helper:.4}."
     );
+    let left_out = results.iter().filter(|r| !r.counts()).count();
+    if left_out > 0 {
+        let _ = writeln!(out, "Left out of the means: {left_out} session(s) that errored or didn't finish.");
+    }
+    let pending = results.iter().filter(|r| r.counts() && r.awaiting_grading() > 0).count();
+    if pending > 0 {
+        let _ = writeln!(
+            out,
+            "{pending} session(s) await grading (--regrade): their cost counts, their reward doesn't yet (\"-\" if none is graded)."
+        );
+    }
+    let deferred = results.iter().filter(|r| r.counts() && r.grading_deferred).count();
+    if deferred > 0 && deferred < results.iter().filter(|r| r.counts()).count() {
+        let _ = writeln!(
+            out,
+            "Mixed regimes: {deferred} session(s) ran with --defer-grading (no grading gap between tickets). Their costs \
+             compare with the others only if the prompt cache outlives the grading gap (Claude Code's 1-hour cache does)."
+        );
+    }
     out
 }
 
@@ -954,7 +1098,108 @@ mod tests {
             hook_compressions: 0,
             hook_bytes_saved: 0,
             tool_calls: BTreeMap::new(),
+            grading_deferred: false,
+            agent_all_models: Usage::default(),
         }
+    }
+
+    #[test]
+    fn summary_leaves_out_errored_sessions_and_pending_rewards() {
+        let mut errored = session(Arm::Squeeze, 0, 0.0, 0.0);
+        errored.error = Some("crashed".into());
+        errored.completed = false;
+        let mut pending = session(Arm::Squeeze, 1, 5.0, 0.0);
+        pending.tickets.push(TicketResult {
+            id: "t".into(),
+            tests_passed: None,
+            rubric: None,
+            reward: 0.0,
+            pushbacks: 0,
+            error: None,
+            tests_frac: None,
+            excluded: Some(GRADING_DEFERRED.into()),
+        });
+        pending.grading_deferred = true;
+        let rs = vec![session(Arm::Vanilla, 0, 10.0, 0.9), session(Arm::Vanilla, 1, 10.0, 0.9), errored, pending];
+        let out = summarize(&rs);
+        let row = out.lines().find(|l| l.starts_with("b ") && l.contains(" squeeze ")).unwrap();
+        // Only the pending session counts: its $5 cost, no reward yet, paired with repeat 1.
+        assert!(row.contains(" 1 ") && row.contains("5.0000") && row.contains("0.50x"), "{row}");
+        assert!(row.split_whitespace().nth(5) == Some("-"), "reward awaits grading: {row}");
+        assert!(out.contains("Left out of the means: 1 session"), "{out}");
+        assert!(out.contains("1 session(s) await grading"), "{out}");
+        assert!(out.contains("Mixed regimes"), "{out}");
+    }
+
+    #[test]
+    fn usage_from_model_usage_includes_every_model() {
+        let r = json!({ "num_turns": 3, "duration_ms": 10, "total_cost_usd": 1.5,
+            "usage": { "input_tokens": 1, "output_tokens": 2, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 10 },
+            "modelUsage": {
+                "claude-opus-5-5": { "inputTokens": 1, "outputTokens": 2, "cacheReadInputTokens": 100, "cacheCreationInputTokens": 10, "costUSD": 1.2 },
+                "claude-haiku-5-5": { "inputTokens": 5, "outputTokens": 6, "cacheReadInputTokens": 50, "cacheCreationInputTokens": 0, "costUSD": 0.3 }
+            } });
+        let mut s = session(Arm::SqueezeScout, 0, 0.0, 0.0);
+        s.agent = Usage::default();
+        s.add_agent_result(&r);
+        assert_eq!(s.agent.cache_read_input_tokens, 100, "main loop only");
+        assert_eq!(s.agent_all_models.cache_read_input_tokens, 150, "subagent model included");
+        assert!((s.agent_all_models.cost_usd - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn agent_cost_is_the_running_total_not_a_sum() {
+        let call = |total: f64, read: u64| {
+            json!({ "total_cost_usd": total, "num_turns": 2,
+                "usage": { "cache_read_input_tokens": read },
+                "modelUsage": { "claude-opus-5-5": { "costUSD": total, "cacheReadInputTokens": read * 2 } } })
+        };
+        let mut s = session(Arm::Vanilla, 0, 0.0, 0.0);
+        s.agent = Usage::default();
+        for (total, read) in [(1.18, 100), (1.78, 50), (2.25, 40)] {
+            s.add_agent_result(&call(total, read));
+        }
+        assert!((s.agent.cost_usd - 2.25).abs() < 1e-9, "latest running total: {}", s.agent.cost_usd);
+        assert_eq!(s.agent.cache_read_input_tokens, 190, "usage is per call, so it adds");
+        assert_eq!(s.agent.invocations, 3);
+        assert!((s.agent_all_models.cost_usd - 2.25).abs() < 1e-9);
+        assert_eq!(s.agent_all_models.cache_read_input_tokens, 80, "modelUsage is a running total too");
+    }
+
+    #[test]
+    fn activity_counts_subagent_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let project = dir.path().join("config/projects/-work");
+        std::fs::create_dir_all(project.join(sid).join("subagents")).unwrap();
+        let call = |id: &str, name: &str, side: bool| {
+            json!({ "isSidechain": side, "message": { "content": [{ "type": "tool_use", "id": id, "name": name }] } })
+                .to_string()
+        };
+        std::fs::write(
+            project.join(format!("{sid}.jsonl")),
+            [call("a", "Bash", false), call("b", "mcp__squeeze__search", true)].join("\n"),
+        )
+        .unwrap();
+        std::fs::write(project.join(sid).join("subagents/agent-1.jsonl"), call("c", "mcp__squeeze__read_many", false))
+            .unwrap();
+        // Cost snapshots: the last one is the session's cost.
+        let mut text = std::fs::read_to_string(project.join(format!("{sid}.jsonl"))).unwrap();
+        for total in [1.5, 4.25] {
+            let state = json!({ "type": "cost-state", "totalCostUSD": total,
+                "modelUsage": { "m": { "costUSD": total, "cacheReadInputTokens": 7 } } });
+            text.push_str(&format!("\n{state}"));
+        }
+        std::fs::write(project.join(format!("{sid}.jsonl")), text).unwrap();
+        let mut s = session(Arm::SqueezeScout, 0, 0.0, 0.0);
+        s.session_id = sid.into();
+        record_activity_in(&dir.path().join("store"), &dir.path().join("config"), &mut s);
+        assert_eq!(s.tool_calls.get("Bash"), Some(&1));
+        assert_eq!(s.tool_calls.get("subagent:mcp__squeeze__search"), Some(&1));
+        assert_eq!(s.tool_calls.get("subagent:mcp__squeeze__read_many"), Some(&1));
+        assert_eq!(s.squeeze_tool_calls(), 2, "the scout's squeeze calls count");
+        assert!((s.agent.cost_usd - 4.25).abs() < 1e-9, "cost from the last snapshot");
+        assert_eq!(s.agent_all_models.cache_read_input_tokens, 7);
     }
 
     #[test]

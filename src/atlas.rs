@@ -25,6 +25,8 @@ use std::time::Duration;
 use tokio::process::Command;
 
 const TOOLS_DIR: &str = "/opt/sqz";
+/// The host as seen from Apple `container`'s default network.
+pub const APPLE_HOST_ADDR: &str = "192.168.64.1";
 const AGENT_CONFIG: &str = "/root/.sqz-claude";
 const AGENT_STORE: &str = "/root/.squeeze";
 const GRADE_TIMEOUT_SECS: u64 = 7200;
@@ -205,6 +207,11 @@ pub struct AtlasCtx<'a> {
     pub squeeze_linux: PathBuf,
     /// Env file with CLAUDE_CODE_OAUTH_TOKEN (subscription runs). Passed by path only.
     pub token_env_file: Option<PathBuf>,
+    /// Env file with ANTHROPIC_API_KEY for the squeeze-proxy arm's agent (the
+    /// proxy accepts API keys only). Passed by path only; other arms keep `--auth`.
+    pub api_key_env_file: Option<PathBuf>,
+    /// The squeeze proxy as the containers reach it, for the squeeze-proxy arm.
+    pub proxy_url: Option<String>,
     /// Extra KEY=VALUE environment for the agent (e.g. a gateway URL).
     pub agent_env: Vec<String>,
     pub cpus: u32,
@@ -217,6 +224,10 @@ pub struct AtlasCtx<'a> {
     pub defer_grading: bool,
     /// Per-session artifacts (patches, grading logs, transcripts).
     pub runs_dir: PathBuf,
+    /// The simulated user's opening message for each ticket, per bundle and
+    /// repeat, shared by every arm (as SessionBench does): the first arm to
+    /// reach a ticket writes it, later arms reuse it.
+    pub openings_dir: PathBuf,
 }
 
 const USERSIM_OPEN: &str = "You are a developer assigning a ticket to a software engineer who works in your \
@@ -259,7 +270,10 @@ pub async fn run_session(
         hook_compressions: 0,
         hook_bytes_saved: 0,
         tool_calls: BTreeMap::new(),
+        grading_deferred: false,
+        agent_all_models: Usage::default(),
     };
+    res.grading_deferred = ctx.defer_grading || previous.is_some_and(|p| p.grading_deferred);
     let outcome = session_inner(ctx, d, bundle, arm, model.as_deref(), &sdir, &mut res).await;
     // Counted from the session's own files, so it also covers sessions that stopped early.
     bench::record_activity_in(&sdir.join("squeeze-home"), &sdir.join("claude-config"), &mut res);
@@ -267,8 +281,20 @@ pub async fn run_session(
         Ok(()) => {
             res.completed = res.tickets.len() == bundle.tasks.len() && res.tickets.iter().all(|t| t.error.is_none())
         }
-        Err(e) if e.is::<bench::LimitReached>() => return Err(e),
+        // Recorded like any other error (the caller stops the run), so a rerun
+        // continues this session from its checkpoint instead of starting over.
         Err(e) => res.error = Some(format!("{e:#}")),
+    }
+    // A session that couldn't even resume keeps what its earlier attempt recorded.
+    if let Some(p) = previous
+        && res.error.is_some()
+        && res.tickets.is_empty()
+        && res.agent.invocations == 0
+    {
+        res.agent = p.agent.clone();
+        res.agent_all_models = p.agent_all_models.clone();
+        res.helpers = p.helpers.clone();
+        res.tickets = p.tickets.clone();
     }
     res.reward = bench::session_reward(&res.tickets);
     Ok(res)
@@ -351,9 +377,13 @@ async fn session_inner(
     res: &mut SessionResult,
 ) -> Result<()> {
     if arm == Arm::SqueezeProxy {
-        bail!("the squeeze-proxy arm is not supported for SWE-Atlas runs");
-    }
-    if ctx.host.auth == Auth::Subscription && ctx.token_env_file.is_none() {
+        if ctx.proxy_url.is_none() {
+            bail!("the squeeze-proxy arm needs the proxy running (bench-atlas starts it when the arm is selected)");
+        }
+        if ctx.api_key_env_file.is_none() && ctx.host.auth != Auth::ApiKey {
+            bail!("the squeeze-proxy arm needs an API key: --api-key-env-file, or --auth api-key");
+        }
+    } else if ctx.host.auth == Auth::Subscription && ctx.token_env_file.is_none() {
         bail!("subscription runs inside containers need --token-env-file (a `claude setup-token` token)");
     }
     let sid = res.session_id.clone();
@@ -446,6 +476,7 @@ async fn session_inner(
         a
     };
 
+    let mut tools_checked = false;
     for (i, task_id) in bundle.tasks.iter().enumerate().skip(res.tickets.len()) {
         if i > 0
             && let Some(p) = d.pause_between_tickets_secs.filter(|p| *p > 0)
@@ -473,6 +504,14 @@ async fn session_inner(
                     &[(&tools_dir, TOOLS_DIR), (&cfg_dir, AGENT_CONFIG), (&store_dir, AGENT_STORE)],
                 )
                 .await?;
+                if arm.uses_mcp() && !tools_checked {
+                    if let Err(e) = check_container_tools(ctx, &name, &bundle.workdir, arm.replaces_file_tools()).await
+                    {
+                        ctx.runtime.remove(&name).await;
+                        return Err(e);
+                    }
+                    tools_checked = true;
+                }
                 let outcome = run_ticket(ctx, d, bundle, &task, &name, &tdir, &agent_args, &mut started, res).await;
                 let patch = match &outcome {
                     Ok(_) => capture_patch(ctx, &name, &bundle.workdir).await,
@@ -488,6 +527,7 @@ async fn session_inner(
         };
         if ctx.defer_grading {
             eprintln!("      grading deferred (run --regrade later)");
+            tr.excluded = Some(bench::GRADING_DEFERRED.into());
             res.tickets.push(tr);
             save_checkpoint(sdir, &cfg_dir, res, started, None)?;
             continue;
@@ -502,6 +542,42 @@ async fn session_inner(
         );
         res.tickets.push(tr);
         save_checkpoint(sdir, &cfg_dir, res, started, None)?;
+    }
+    Ok(())
+}
+
+/// The squeeze binary in the containers must serve exactly the tools this
+/// build describes: arms that replace Claude Code's file tools tell the agent
+/// how those tools behave, and a stale Linux build would contradict that.
+async fn check_container_tools(ctx: &AtlasCtx<'_>, name: &str, workdir: &str, edit_tool: bool) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut c = exec_cmd(ctx, name, workdir, None, &[]);
+    c.arg(format!("{TOOLS_DIR}/squeeze")).args(["mcp", "--root", workdir]);
+    if edit_tool {
+        c.arg("--edit-tool");
+    }
+    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let mut child = c.spawn().context("checking the container's squeeze binary")?;
+    let mut stdin = child.stdin.take().context("stdin")?;
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "squeeze-bench", "version": "1" } } });
+    let list = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
+    stdin.write_all(format!("{init}\n{list}\n").as_bytes()).await?;
+    drop(stdin);
+    let out = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
+        .await
+        .map_err(|_| anyhow!("checking the container's squeeze binary timed out"))??;
+    let tools = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["id"] == 2)
+        .and_then(|v| v["result"]["tools"].as_array().cloned());
+    if tools.as_deref() != Some(crate::mcp::tool_definitions(edit_tool).as_slice()) {
+        bail!(
+            "the squeeze binary for the containers ({}) serves different tools than this build; rebuild it from the \
+             same source (see README: SWE-Atlas runs)",
+            ctx.squeeze_linux.display()
+        );
     }
     Ok(())
 }
@@ -523,18 +599,31 @@ async fn start_container(ctx: &AtlasCtx<'_>, name: &str, image: &str, mounts: &[
 
 /// `container exec` with the agent's environment. Credentials are passed by
 /// reference only: an env-file path, or `-e NAME` to inherit a variable.
-fn exec_cmd(ctx: &AtlasCtx<'_>, name: &str, workdir: &str, agent_path: Option<&str>) -> Command {
+fn exec_cmd(
+    ctx: &AtlasCtx<'_>,
+    name: &str,
+    workdir: &str,
+    agent_path: Option<&str>,
+    env: &[(&str, String)],
+) -> Command {
     let mut c = Command::new(ctx.runtime.bin());
     c.args(["exec", "-i"]);
-    match ctx.host.auth {
-        Auth::Subscription => {
+    let set_here = |k: &str| env.iter().any(|(e, _)| *e == k);
+    // Going through the squeeze proxy: the agent authenticates with the API key
+    // file, and never gets the subscription token (the proxy refuses it anyway).
+    let proxied = set_here("ANTHROPIC_BASE_URL");
+    match (&ctx.api_key_env_file, ctx.host.auth) {
+        (Some(f), _) if proxied => {
+            c.arg("--env-file").arg(f);
+        }
+        (_, Auth::Subscription) => {
             if let Some(f) = &ctx.token_env_file {
                 c.arg("--env-file").arg(f);
             }
         }
-        Auth::ApiKey => {
+        (_, Auth::ApiKey) => {
             for k in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"] {
-                let overridden = ctx.agent_env.iter().any(|kv| kv.starts_with(&format!("{k}=")));
+                let overridden = set_here(k) || ctx.agent_env.iter().any(|kv| kv.starts_with(&format!("{k}=")));
                 if std::env::var_os(k).is_some() && !overridden {
                     c.args(["-e", k]);
                 }
@@ -542,7 +631,13 @@ fn exec_cmd(ctx: &AtlasCtx<'_>, name: &str, workdir: &str, agent_path: Option<&s
         }
     }
     for kv in &ctx.agent_env {
-        c.args(["-e", kv]);
+        // Variables this command sets itself (the proxy URL) win.
+        if !kv.split_once('=').is_some_and(|(k, _)| set_here(k)) {
+            c.args(["-e", kv]);
+        }
+    }
+    for (k, v) in env {
+        c.args(["-e", &format!("{k}={v}")]);
     }
     if let Some(p) = agent_path {
         c.args(["-e", &format!("PATH={p}")]);
@@ -575,26 +670,48 @@ async fn run_ticket(
         tests_frac: None,
         excluded: None,
     };
-    let mut message = match d.usersim_model.as_deref() {
-        Some(m) => {
+    let opening =
+        ctx.openings_dir.join(&bundle.name).join(format!("r{}", res.repeat + 1)).join(format!("{}.txt", task.id));
+    let mut message = match (d.usersim_model.as_deref(), std::fs::read_to_string(&opening)) {
+        (Some(_), Ok(shared)) if !shared.trim().is_empty() => shared,
+        (Some(m), _) => {
             let r = bench::helper(ctx.host, tdir, &bench::helper_args(m, USERSIM_OPEN), &task.instruction, 600).await?;
             res.helpers.add_result(&r);
-            r.get("result")
+            let text = r
+                .get("result")
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or(&task.instruction)
-                .to_string()
+                .to_string();
+            if let Some(dir) = opening.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&opening, &text)?;
+            text
         }
-        None => task.instruction.clone(),
+        (None, _) => task.instruction.clone(),
     };
     let timeout = d.timeout_secs.unwrap_or(10_800);
     let mut conversation: Vec<String> = Vec::new();
     loop {
-        let mut cmd = exec_cmd(ctx, name, &bundle.workdir, bundle.agent_path.as_deref());
+        let mut env = res.arm.env();
+        if res.arm == Arm::SqueezeProxy
+            && let Some(url) = &ctx.proxy_url
+        {
+            env.push(("ANTHROPIC_BASE_URL", url.clone()));
+            // Same cache lifetime as subscription sessions (API-key sessions default to 5 minutes).
+            env.push(("ENABLE_PROMPT_CACHING_1H", "1".into()));
+        }
+        let mut cmd = exec_cmd(ctx, name, &bundle.workdir, bundle.agent_path.as_deref(), &env);
         cmd.arg(format!("{TOOLS_DIR}/claude")).args(agent_args(*started));
         let result = bench::run_claude_command(cmd, &message, timeout).await?;
         *started = true;
-        res.agent.add_result(&result);
+        res.add_agent_result(&result);
+        // Each raw result, for auditing usage and cost per model later.
+        let n = std::fs::read_dir(tdir).map_or(0, |d| {
+            d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("agent-result-")).count()
+        });
+        std::fs::write(tdir.join(format!("agent-result-{}.json", n + 1)), serde_json::to_vec_pretty(&result)?)?;
         let reply = result.get("result").and_then(Value::as_str).unwrap_or("").to_string();
         if result.get("is_error").and_then(Value::as_bool) == Some(true) {
             tr.error = Some(crate::util::truncate_chars(&reply, 300));
@@ -629,7 +746,7 @@ async fn run_ticket(
 }
 
 async fn capture_patch(ctx: &AtlasCtx<'_>, name: &str, workdir: &str) -> Result<String> {
-    let mut c = exec_cmd(ctx, name, workdir, None);
+    let mut c = exec_cmd(ctx, name, workdir, None, &[]);
     c.args(["bash", "-c", "git add -A -- . ':!.claude' && git diff --cached HEAD; git reset -q"]);
     run_ok(c, "capturing the agent's patch").await
 }
@@ -729,57 +846,66 @@ async fn grade_tests(
     Ok(())
 }
 
-/// Grade what is missing, from the saved patches: the tests of tickets that
-/// have no test score (grading failed, or was deferred), and, given a judge
-/// model, the rubric of tickets that have no rubric score. Existing scores
-/// are kept; only the judge calls a model.
-pub async fn regrade(
+/// Grade what is missing in one recorded session, from its saved patches: the
+/// tests of tickets without a test score (failed, or deferred), and, given a
+/// judge model, the rubric of tickets without a rubric score. Existing scores
+/// are kept; only the judge calls a model. A ticket that can't be graded is
+/// marked excluded with the reason and the rest go on; a usage limit stops.
+pub async fn regrade_session(
     ctx: &AtlasCtx<'_>,
-    file: &AtlasFile,
-    results: &[SessionResult],
+    bundle: &AtlasBundle,
+    r: &mut SessionResult,
     judge_model: Option<&str>,
-) -> Result<Vec<SessionResult>> {
-    let mut out = Vec::new();
-    for r in results {
-        let mut r = r.clone();
-        let bundle = file
-            .bundles
-            .iter()
-            .find(|b| b.name == r.bundle)
-            .with_context(|| format!("bundle {} not in file", r.bundle))?;
-        let sdir = session_dir(ctx, &r.bundle, r.arm, r.repeat, &r.session_id);
-        eprintln!("regrading {} / {} / repeat {}", r.bundle, r.arm.name(), r.repeat + 1);
-        for (i, tr) in r.tickets.iter_mut().enumerate() {
-            let needs_tests = tr.tests_frac.is_none();
-            let needs_rubric = tr.rubric.is_none() && judge_model.is_some();
-            if !needs_tests && !needs_rubric {
-                eprintln!("    {}: already graded; kept", tr.id);
-                continue;
-            }
+) -> Result<()> {
+    let sdir = session_dir(ctx, &r.bundle, r.arm, r.repeat, &r.session_id);
+    eprintln!("regrading {} / {} / repeat {}", r.bundle, r.arm.name(), r.repeat + 1);
+    for i in 0..r.tickets.len() {
+        let tr = &r.tickets[i];
+        let needs_tests = tr.tests_frac.is_none();
+        let needs_rubric = tr.rubric.is_none() && judge_model.is_some();
+        if !needs_tests && !needs_rubric {
+            eprintln!("    {}: already graded; kept", tr.id);
+            continue;
+        }
+        let tdir = sdir.join("tickets").join(format!("{}-{}", i + 1, tr.id));
+        let mut tr = tr.clone();
+        let graded: Result<()> = async {
             let task = load_task(&ctx.root, &tr.id)?;
-            let tdir = sdir.join("tickets").join(format!("{}-{}", i + 1, tr.id));
             let patch = std::fs::read_to_string(tdir.join("agent.patch"))
                 .with_context(|| format!("no saved patch in {}", tdir.display()))?;
             if needs_tests {
-                grade_tests(ctx, bundle, &task, &patch, &tdir, tr).await?;
+                grade_tests(ctx, bundle, &task, &patch, &tdir, &mut tr).await?;
             }
             if needs_rubric {
                 tr.rubric = judge(ctx, judge_model, &task, &patch, &tdir, &mut r.helpers).await?;
             }
-            tr.reward = ticket_reward(tr);
-            eprintln!(
-                "    {}: tests {} x rubric {} = {:.3}{}",
-                tr.id,
-                tr.tests_frac.map_or("-".into(), |t| format!("{t:.3}")),
-                tr.rubric.map_or("-".into(), |x| format!("{x:.3}")),
-                tr.reward,
-                tr.excluded.as_ref().map_or(String::new(), |e| format!(" (excluded: {e})"))
-            );
+            Ok(())
         }
+        .await;
+        match graded {
+            Ok(()) => {}
+            Err(e) if e.is::<bench::LimitReached>() => return Err(e),
+            Err(e) => {
+                tr.excluded = Some(format!("grading_error: {}", crate::util::truncate_chars(&format!("{e:#}"), 200)))
+            }
+        }
+        tr.reward = ticket_reward(&tr);
+        eprintln!(
+            "    {}: tests {} x rubric {} = {:.3}{}",
+            tr.id,
+            tr.tests_frac.map_or("-".into(), |t| format!("{t:.3}")),
+            tr.rubric.map_or("-".into(), |x| format!("{x:.3}")),
+            tr.reward,
+            tr.excluded.as_ref().map_or(String::new(), |e| format!(" (excluded: {e})"))
+        );
+        r.tickets[i] = tr;
         r.reward = bench::session_reward(&r.tickets);
-        out.push(r);
     }
-    Ok(out)
+    r.reward = bench::session_reward(&r.tickets);
+    // Recount from the session's own files; this also corrects rows recorded
+    // before costs were read as running totals.
+    bench::record_activity_in(&sdir.join("squeeze-home"), &sdir.join("claude-config"), r);
+    Ok(())
 }
 
 /// SessionBench's fractional test score from test.sh's outputs: relevant
@@ -919,6 +1045,8 @@ mod tests {
             hook_compressions: 0,
             hook_bytes_saved: 0,
             tool_calls: BTreeMap::new(),
+            grading_deferred: false,
+            agent_all_models: Usage::default(),
         };
         save_checkpoint(sdir, &cfg, &res, true, Some(&ticket("t2"))).unwrap();
         let cp: Checkpoint = serde_json::from_slice(&std::fs::read(sdir.join(CHECKPOINT)).unwrap()).unwrap();

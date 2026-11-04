@@ -38,8 +38,7 @@ pub const TRIMMED_BUILTINS: &[&str] = &["Workflow", "ScheduleWakeup", "ReportFin
 /// and `outline` replace when squeeze takes over file access.
 pub const REPLACED_BUILTINS: &[&str] = &["Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit", "MultiEdit"];
 
-/// Appended to the system prompt of the agent and its subagents when squeeze
-/// takes over file access.
+/// Appended to the main agent's system prompt when squeeze takes over file access.
 pub const FILE_TOOLS_GUIDE: &str = "# File tools
 Claude Code's Read, Edit, Write, Grep and Glob tools are turned off in this session. squeeze's MCP tools replace them:
 - Read files with mcp__squeeze__read_many. Put every file and line range you need next into one call. For a large \
@@ -50,8 +49,21 @@ matching files; without a pattern it lists files.
 create a file; set overwrite to replace a whole file. Read a file with read_many before you edit it. Don't re-read a \
 file only to check an edit: the reply says where each edit landed.
 - Use Bash to run things: tests, builds, type checks, linters, formatters, git, package managers. Don't use Bash to \
-read or search files (cat, head, tail, sed -n, awk, grep, rg, find, ls) or to write them (sed -i, cat > file, \
-echo >, tee, scripts that rewrite files); use the tools above.";
+read or search project files (cat, head, tail, sed -n, awk, grep, rg, find, ls) or to write them (sed -i, cat > \
+file, echo >, tee, scripts that rewrite files); use the tools above. squeeze's tools only reach the project, so read \
+files outside it (dependency sources, saved tool output) with Bash.";
+
+/// Appended to subagents' system prompts when squeeze takes over file access.
+/// Subagents are often read-only (Explore, Plan), so editing is conditional.
+pub const SUBAGENT_FILE_TOOLS_GUIDE: &str = "# File tools
+Claude Code's Read, Grep and Glob tools are turned off in this session; use squeeze's MCP tools instead:
+- Read files with mcp__squeeze__read_many, several files and line ranges per call; for a large file, call \
+mcp__squeeze__outline first.
+- Find code with mcp__squeeze__search (regex, grouped by file); files_only lists matching files, and without a \
+pattern it lists files.
+- Don't use Bash to read or search project files (cat, sed -n, grep, find, ls); squeeze's tools only reach the \
+project, so read files outside it with Bash. If your task is to change files and you have mcp__squeeze__edit_many, \
+change them with it, read with read_many first.";
 
 /// Appended to the main agent's system prompt with [`FILE_TOOLS_GUIDE`].
 pub const WORKING_GUIDE: &str = "# Working economically
@@ -71,10 +83,125 @@ pub fn scout_agents_json() -> String {
     serde_json::json!({ "Explore": {
         "description": "Read-only code scout for questions that would take three or more reads or searches across files. Returns the files, line ranges and findings that matter.",
         "prompt": "You are a read-only code scout. Answer the caller's question about the codebase with squeeze's tools: mcp__squeeze__search to find code, mcp__squeeze__outline for the structure of a large file, and mcp__squeeze__read_many to read the relevant ranges, several per call. Use Bash only for read-only commands such as git log; never change files. Finish in 3 to 6 tool calls unless the caller sets another budget. Reply with FILES (path and line ranges that matter), FINDINGS (what the code does, quoting only the lines the caller needs) and NEXT (what to read or change next).",
-        "tools": ["Bash", "mcp__squeeze__read_many", "mcp__squeeze__search", "mcp__squeeze__outline"],
+        "tools": ["Bash", "mcp__squeeze__read_many", "mcp__squeeze__search", "mcp__squeeze__outline", "mcp__squeeze__expand"],
         "model": "inherit"
     }})
     .to_string()
+}
+
+/// The tools the server lists, as JSON schemas.
+pub fn tool_definitions(edit_tool: bool) -> Vec<Value> {
+    let read_only = json!({ "readOnlyHint": true, "openWorldHint": false });
+    let mut tools = vec![
+        json!({
+            "name": "read_many",
+            "title": "Read many files",
+            "description": if edit_tool {
+                "Read several files, or line ranges of them, in one call: put every file and range you need next into one call. Output is numbered `N<TAB>line`. Paths are relative to the project root or absolute (inside the project). edit_many needs a read_many read of a file before editing it."
+            } else {
+                "Read several files, or line ranges of them, in one call. Prefer this over separate Read calls whenever you need two or more files or ranges. Output uses the same `N<TAB>line` numbering as Read. Paths are relative to the project root or absolute. Claude Code's Edit tool still requires a Read of a file before editing it, so Read the specific file you are about to edit."
+            },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array", "minItems": 1, "maxItems": 50,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "offset": { "type": "integer", "minimum": 1, "description": "First line to show (1-based)." },
+                                "limit": { "type": "integer", "minimum": 1, "maximum": 5000, "description": "Maximum lines to show (default 2000)." }
+                            },
+                            "required": ["path"]
+                        }
+                    }
+                },
+                "required": ["files"]
+            },
+            "annotations": read_only,
+        }),
+        json!({
+            "name": "outline",
+            "title": "Outline files",
+            "description": "List the definitions (functions, classes, types, impls, headings) in one or more files with their line ranges, nested by scope. Use it before reading a large file, then read only the ranges you need with read_many. Supports Rust, Python, JS/TS, Go, Java/Kotlin/C#/Scala/Swift, C/C++, Ruby and Markdown.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "paths": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 50 } },
+                "required": ["paths"]
+            },
+            "annotations": read_only,
+        }),
+        json!({
+            "name": "search",
+            "title": "Search code",
+            "description": "Regex search across the project, honoring .gitignore. Results are grouped by file (path printed once) with optional context lines and a match budget, so output stays small. Use glob to restrict files (for example \"*.rs\" or \"src/**/*.ts\"). files_only lists matching files with match counts (like grep -l). Without a pattern it lists files (like find or ls -R).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Regular expression (Rust regex syntax). Omit to list files." },
+                    "path": { "type": "string", "description": "Directory or file to search (default: project root)." },
+                    "glob": { "type": "string", "description": "Only files matching this glob, relative to the project root (\"src/**/*.ts\"); one without / matches file names at any depth (\"*.rs\")." },
+                    "ignore_case": { "type": "boolean" },
+                    "fixed_string": { "type": "boolean", "description": "Treat pattern as a literal string." },
+                    "context": { "type": "integer", "minimum": 0, "maximum": 10 },
+                    "files_only": { "type": "boolean", "description": "List matching files with match counts instead of lines." },
+                    "max_matches": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "With a pattern: matching lines (files, with files_only) to show; default 100. Without a pattern: files to list; default 200." }
+                }
+            },
+            "annotations": read_only,
+        }),
+        json!({
+            "name": "expand",
+            "title": "Expand compressed output",
+            "description": "Return the full original of a tool output that squeeze compressed. Use the id from the [squeeze: ...] note. Supports offset/limit to page through long outputs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "offset": { "type": "integer", "minimum": 1 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10000 }
+                },
+                "required": ["id"]
+            },
+            "annotations": read_only,
+        }),
+    ];
+    if edit_tool {
+        tools.push(json!({
+            "name": "edit_many",
+            "title": "Edit many",
+            "description": "Change files in one call: exact-string replacements across one or more files, new files, and full rewrites. Batch every edit you have ready into one call. Every edit is validated before any file is written. An existing file must have been read with read_many in this session; if it changed since (a formatter, a script), edits still apply when old_string matches exactly. Each old_string must match exactly once unless replace_all is true. To create a file, omit old_string. To replace a whole file, set overwrite. The reply says where each edit landed, so there is no need to re-read a file to check an edit.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array", "minItems": 1, "maxItems": 100,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "old_string": { "type": "string", "description": "Exact text to replace. Omit to create a new file." },
+                                "new_string": { "type": "string" },
+                                "replace_all": { "type": "boolean" },
+                                "overwrite": { "type": "boolean", "description": "Replace the whole file with new_string." }
+                            },
+                            "required": ["path", "new_string"]
+                        }
+                    }
+                },
+                "required": ["edits"]
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false },
+        }));
+    }
+    // Claude Code defers MCP tools behind tool search by default: the model
+    // sees only their names and rarely loads them. These tools only pay off
+    // if the model picks them over Bash and Read, so they are always loaded.
+    for t in &mut tools {
+        t["_meta"] = json!({ "anthropic/alwaysLoad": true });
+    }
+    tools
 }
 
 /// Read-only squeeze tools, safe to pre-approve.
@@ -110,7 +237,7 @@ impl Server {
         let result = match method {
             "initialize" => Ok(self.initialize(&params)),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": self.tool_definitions() })),
+            "tools/list" => Ok(json!({ "tools": tool_definitions(self.edit_tool) })),
             "tools/call" => Ok(self.call(&params)),
             m if m.starts_with("notifications/") => return None,
             m => Err(format!("method not found: {m}")),
@@ -148,116 +275,6 @@ impl Server {
             Ok(text) => json!({ "content": [{ "type": "text", "text": text }] }),
             Err(e) => json!({ "content": [{ "type": "text", "text": format!("error: {e:#}") }], "isError": true }),
         }
-    }
-
-    fn tool_definitions(&self) -> Vec<Value> {
-        let read_only = json!({ "readOnlyHint": true, "openWorldHint": false });
-        let mut tools = vec![
-            json!({
-                "name": "read_many",
-                "title": "Read many files",
-                "description": "Read several files, or line ranges of them, in one call. Prefer this over separate Read calls whenever you need two or more files or ranges. Output uses the same `N<TAB>line` numbering as Read. Paths are relative to the project root or absolute. Claude Code's Edit tool still requires a Read of a file before editing it, so Read the specific file you are about to edit.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "files": {
-                            "type": "array", "minItems": 1, "maxItems": 50,
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "path": { "type": "string" },
-                                    "offset": { "type": "integer", "minimum": 1, "description": "First line to show (1-based)." },
-                                    "limit": { "type": "integer", "minimum": 1, "maximum": 5000, "description": "Maximum lines to show (default 2000)." }
-                                },
-                                "required": ["path"]
-                            }
-                        }
-                    },
-                    "required": ["files"]
-                },
-                "annotations": read_only,
-            }),
-            json!({
-                "name": "outline",
-                "title": "Outline files",
-                "description": "List the definitions (functions, classes, types, impls, headings) in one or more files with their line ranges, nested by scope. Use it before reading a large file, then read only the ranges you need with read_many. Supports Rust, Python, JS/TS, Go, Java/Kotlin/C#/Scala/Swift, C/C++, Ruby and Markdown.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": { "paths": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 50 } },
-                    "required": ["paths"]
-                },
-                "annotations": read_only,
-            }),
-            json!({
-                "name": "search",
-                "title": "Search code",
-                "description": "Regex search across the project, honoring .gitignore. Results are grouped by file (path printed once) with optional context lines and a match budget, so output stays small. Use glob to restrict files (for example \"*.rs\" or \"src/**/*.ts\"). files_only lists matching files with match counts (like grep -l). Without a pattern it lists files (like find or ls -R).",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "pattern": { "type": "string", "description": "Regular expression (Rust regex syntax). Omit to list files." },
-                        "path": { "type": "string", "description": "Directory or file to search (default: project root)." },
-                        "glob": { "type": "string" },
-                        "ignore_case": { "type": "boolean" },
-                        "fixed_string": { "type": "boolean", "description": "Treat pattern as a literal string." },
-                        "context": { "type": "integer", "minimum": 0, "maximum": 10 },
-                        "files_only": { "type": "boolean", "description": "List matching files with match counts instead of lines." },
-                        "max_matches": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Default 100 matches (200 files when listing)." }
-                    }
-                },
-                "annotations": read_only,
-            }),
-            json!({
-                "name": "expand",
-                "title": "Expand compressed output",
-                "description": "Return the full original of a tool output that squeeze compressed. Use the id from the [squeeze: ...] note. Supports offset/limit to page through long outputs.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "offset": { "type": "integer", "minimum": 1 },
-                        "limit": { "type": "integer", "minimum": 1, "maximum": 10000 }
-                    },
-                    "required": ["id"]
-                },
-                "annotations": read_only,
-            }),
-        ];
-        if self.edit_tool {
-            tools.push(json!({
-                "name": "edit_many",
-                "title": "Edit many",
-                "description": "Change files in one call: exact-string replacements across one or more files, new files, and full rewrites. Batch every edit you have ready into one call. Every edit is validated before any file is written. An existing file must have been read with read_many in this session; if it changed since (a formatter, a script), edits still apply when old_string matches exactly. Each old_string must match exactly once unless replace_all is true. To create a file, omit old_string. To replace a whole file, set overwrite. The reply says where each edit landed, so there is no need to re-read a file to check an edit.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "edits": {
-                            "type": "array", "minItems": 1, "maxItems": 100,
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "path": { "type": "string" },
-                                    "old_string": { "type": "string", "description": "Exact text to replace. Omit to create a new file." },
-                                    "new_string": { "type": "string" },
-                                    "replace_all": { "type": "boolean" },
-                                    "overwrite": { "type": "boolean", "description": "Replace the whole file with new_string." }
-                                },
-                                "required": ["path", "new_string"]
-                            }
-                        }
-                    },
-                    "required": ["edits"]
-                },
-                "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false },
-            }));
-        }
-        // Claude Code defers MCP tools behind tool search by default: the model
-        // sees only their names and rarely loads them. These tools only pay off
-        // if the model picks them over Bash and Read, so they are always loaded.
-        for t in &mut tools {
-            t["_meta"] = json!({ "anthropic/alwaysLoad": true });
-        }
-        tools
     }
 }
 
@@ -328,6 +345,30 @@ mod tests {
 
         let unknown = rpc(&mut s, json!({ "jsonrpc": "2.0", "id": 5, "method": "resources/list" }));
         assert_eq!(unknown["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn guidance_names_only_tools_that_exist() {
+        let known: Vec<String> =
+            READ_ONLY_TOOLS.iter().chain(&["edit_many"]).map(|t| format!("mcp__squeeze__{t}")).collect();
+        let scout: Value = serde_json::from_str(&scout_agents_json()).unwrap();
+        let scout_tools: Vec<&str> =
+            scout["Explore"]["tools"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(scout_tools.contains(&"mcp__squeeze__expand"), "hook footers point subagents at expand");
+        let texts = [FILE_TOOLS_GUIDE, SUBAGENT_FILE_TOOLS_GUIDE, WORKING_GUIDE, SCOUT_GUIDE, INSTRUCTIONS_WITH_EDIT];
+        let re = regex::Regex::new(r"mcp__squeeze__[a-z_]+").unwrap();
+        for text in texts.iter().copied().chain([scout["Explore"]["prompt"].as_str().unwrap()]) {
+            for m in re.find_iter(text) {
+                assert!(known.iter().any(|k| k == m.as_str()), "unknown tool {} in guidance", m.as_str());
+            }
+        }
+        for t in scout_tools.iter().filter(|t| t.starts_with("mcp__")) {
+            assert!(known.iter().any(|k| k == t), "scout lists unknown tool {t}");
+        }
+        assert!(
+            !SUBAGENT_FILE_TOOLS_GUIDE.contains("Change files with"),
+            "subagents aren't told to edit unconditionally"
+        );
     }
 
     #[test]

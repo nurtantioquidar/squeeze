@@ -34,7 +34,7 @@ enum Cmd {
     /// Claude Code hook entry point (registered for you by `squeeze run`)
     #[command(hide = true)]
     Hook {
-        /// Hook event; only post-tool-use is supported
+        /// Hook event: post-tool-use (compression) or pre-tool-use (edit_many permissions)
         event: String,
         /// Where compressed-output notes point: mcp or cli
         #[arg(long, default_value = "cli")]
@@ -56,7 +56,7 @@ enum Cmd {
     /// A/B benchmark tasks with and without squeeze (needs ANTHROPIC_API_KEY; costs money)
     Bench(BenchArgs),
     /// SessionBench-style runs over SWE-Atlas tasks in containers (see bench/swe-atlas-rf.toml)
-    BenchAtlas(AtlasArgs),
+    BenchAtlas(Box<AtlasArgs>),
     /// Delete stored originals older than N days
     Gc {
         #[arg(long, default_value_t = 30)]
@@ -120,6 +120,11 @@ struct RunArgs {
     /// ReportFindings, ListAgents): each is sent in full with every request
     #[arg(long)]
     trim_tools: bool,
+    /// Have Claude Code compact the conversation within this many tokens of context
+    /// (it sets CLAUDE_CODE_AUTO_COMPACT_WINDOW; compaction starts somewhat below it).
+    /// Every request re-reads the whole context, so a smaller one costs less.
+    #[arg(long, value_name = "TOKENS")]
+    compact_window: Option<u64>,
     /// With --proxy: Claude Code authenticates through an apiKeyHelper in your settings
     #[arg(long)]
     api_key_helper: bool,
@@ -224,6 +229,18 @@ struct AtlasArgs {
     /// Skip grading during sessions (10-20 minutes per ticket); grade afterwards with --regrade
     #[arg(long)]
     defer_grading: bool,
+    /// API key for the squeeze-proxy arm's agent: a chmod 600 file holding ANTHROPIC_API_KEY=...
+    /// Passed to the containers by path, never read. Other arms, the simulated user and the
+    /// judge keep --auth, so only the proxied agent's tokens are billed to the key.
+    #[arg(long)]
+    api_key_env_file: Option<PathBuf>,
+    /// Where the squeeze-proxy arm's proxy forwards to [default: Anthropic's API]
+    #[arg(long)]
+    proxy_upstream: Option<String>,
+    /// Where the simulated user's opening messages are shared between arms
+    /// [default: <out>.d/openings]; point several results files at one directory to pair them
+    #[arg(long)]
+    openings: Option<PathBuf>,
     /// `subscription` (needs --token-env-file) or `api-key`; with --regrade, only to judge missing rubrics
     #[arg(long)]
     auth: Option<String>,
@@ -440,13 +457,17 @@ async fn cmd_run(a: RunArgs) -> Result<i32> {
         None
     };
 
-    let settings = if !a.proxy && !a.compress.no_compress {
+    let mut settings = if !a.proxy && !a.compress.no_compress {
         squeeze::hook::session_settings(&exe, !a.no_mcp)
     } else if !a.no_mcp {
         json!({ "permissions": { "allow": tool_names() } })
     } else {
         json!({})
     };
+    if !a.no_mcp && (a.edit_tool || a.replace_file_tools) {
+        // edit_many is approved without asking exactly when Edit would be.
+        squeeze::hook::add_edit_permission_hook(&mut settings, &exe);
+    }
     if settings.as_object().is_some_and(|m| !m.is_empty()) {
         merge_settings_arg(&mut args, settings)?;
     }
@@ -455,10 +476,18 @@ async fn cmd_run(a: RunArgs) -> Result<i32> {
     let mut off: Vec<&str> = Vec::new();
     if a.replace_file_tools {
         off.extend(squeeze::mcp::REPLACED_BUILTINS);
-        args.push("--append-system-prompt".into());
-        args.push(format!("{}\n\n{}", squeeze::mcp::FILE_TOOLS_GUIDE, squeeze::mcp::WORKING_GUIDE));
-        args.push("--append-subagent-system-prompt".into());
-        args.push(squeeze::mcp::FILE_TOOLS_GUIDE.into());
+        // Claude Code keeps only the last of each of these flags, and refuses a
+        // flag together with its -file form: merge the user's text into ours.
+        let guide = format!("{}\n\n{}", squeeze::mcp::FILE_TOOLS_GUIDE, squeeze::mcp::WORKING_GUIDE);
+        let main_prompt = merged_prompt(&mut args, "--append-system-prompt", &guide)?;
+        let sub_prompt =
+            merged_prompt(&mut args, "--append-subagent-system-prompt", squeeze::mcp::SUBAGENT_FILE_TOOLS_GUIDE)?;
+        args.extend([
+            "--append-system-prompt".into(),
+            main_prompt,
+            "--append-subagent-system-prompt".into(),
+            sub_prompt,
+        ]);
     }
     if a.trim_tools {
         off.extend(squeeze::mcp::TRIMMED_BUILTINS);
@@ -472,6 +501,9 @@ async fn cmd_run(a: RunArgs) -> Result<i32> {
         args.push(mcp_config(&store, &std::env::current_dir()?, a.edit_tool || a.replace_file_tools)?);
     }
     cmd.args(&args).env("SQUEEZE_HOME", store.root());
+    if let Some(w) = a.compact_window {
+        cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", w.to_string());
+    }
     let mut child = cmd.spawn().with_context(|| format!("could not start `{}`", a.claude_bin))?;
     // Ctrl-C belongs to claude (same process group); keep squeeze alive until it exits.
     let status = loop {
@@ -827,7 +859,7 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
         Some("subscription") => bench::Auth::Subscription,
         Some("api-key") => bench::Auth::ApiKey,
         Some(other) => bail!("--auth must be `subscription` or `api-key`, not {other:?}"),
-        None if a.regrade => bench::Auth::ApiKey, // unused: regrading calls no model
+        None if a.regrade => bench::Auth::ApiKey, // unused: without --auth, regrading calls no model
         None => bail!("--auth is required (`subscription` or `api-key`)"),
     };
     let runtime = match a.runtime.as_str() {
@@ -836,7 +868,9 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
         other => bail!("--runtime must be `container` or `docker`, not {other:?}"),
     };
     match auth {
-        _ if a.regrade => {}
+        _ if a.regrade && a.auth.is_none() => {}
+        // The judge runs on the host's own Claude Code login; no token file needed.
+        bench::Auth::Subscription if a.regrade => {}
         bench::Auth::Subscription => {
             let f = a.token_env_file.as_ref().context(
                 "subscription runs need --token-env-file: a file with CLAUDE_CODE_OAUTH_TOKEN=... from `claude setup-token`",
@@ -915,28 +949,56 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
             claude_linux,
             squeeze_linux,
             token_env_file: None,
+            api_key_env_file: None,
+            proxy_url: None,
             agent_env: Vec::new(),
             cpus: a.cpus,
             memory: a.memory.clone(),
             dns: a.dns.clone(),
             judge_batch: a.judge_batch,
             defer_grading: false,
+            openings_dir: runs_dir.join("openings"),
             runs_dir,
         };
-        // The judge calls a model, so it needs an explicit --auth.
-        let unjudged = results.iter().flat_map(|r| &r.tickets).filter(|t| t.rubric.is_none()).count();
-        let judge = file.defaults.judge_model.as_deref().filter(|_| a.auth.is_some());
-        if unjudged > 0 && file.defaults.judge_model.is_some() && judge.is_none() {
-            eprintln!("note: {unjudged} ticket(s) have no rubric score; pass --auth to judge them");
+        // Build on earlier regrades: a session already in <out>.regraded.jsonl is
+        // taken from there, so finished grading (and paid judge calls) is kept.
+        let regraded_path = PathBuf::from(format!("{}.regraded.jsonl", out_path.display()));
+        let earlier = bench::read_results(&regraded_path);
+        let same = |x: &bench::SessionResult, y: &bench::SessionResult| {
+            x.session_id == y.session_id && x.bundle == y.bundle && x.arm == y.arm && x.repeat == y.repeat
+        };
+        let mut rows: Vec<bench::SessionResult> =
+            results.iter().map(|r| earlier.iter().find(|e| same(e, r)).cloned().unwrap_or_else(|| r.clone())).collect();
+        let selected = |r: &bench::SessionResult| file.bundles.iter().any(|b| b.name == r.bundle);
+        let unjudged =
+            rows.iter().filter(|r| selected(r)).flat_map(|r| &r.tickets).filter(|t| t.rubric.is_none()).count();
+        // A ticket the configured judge hasn't scored must not be counted with
+        // the rubric taken as 1.0, so judging it needs a decision.
+        let judge = match (file.defaults.judge_model.as_deref(), a.auth.is_some()) {
+            (Some(m), true) => Some(m),
+            (Some(_), false) if unjudged > 0 => bail!(
+                "{unjudged} ticket(s) have no rubric score yet: pass --auth to judge them, or --judge-model none to \
+                 score their tests only"
+            ),
+            _ => None,
+        };
+        if !earlier.is_empty() {
+            eprintln!("continuing from {}", regraded_path.display());
         }
-        let regraded = atlas::regrade(&ctx, &file, &results, judge).await?;
-        let path = PathBuf::from(format!("{}.regraded.jsonl", out_path.display()));
-        let mut f = std::fs::File::create(&path)?;
-        for r in &regraded {
-            writeln!(f, "{}", serde_json::to_string(r)?)?;
+        for i in 0..rows.len() {
+            // Rows of bundles not selected with --bundles pass through unchanged.
+            let Some(bundle) = file.bundles.iter().find(|b| b.name == rows[i].bundle) else { continue };
+            let mut r = rows[i].clone();
+            let outcome = atlas::regrade_session(&ctx, bundle, &mut r, judge).await;
+            rows[i] = r;
+            write_results(&regraded_path, &rows)?;
+            if let Err(e) = outcome {
+                eprintln!("stopped: {e:#}\nGrading so far is saved; rerun the same command to continue.",);
+                break;
+            }
         }
-        println!("{}", bench::summarize(&regraded));
-        println!("Regraded results: {}", path.display());
+        println!("{}", bench::summarize(&rows));
+        println!("Regraded results: {}", regraded_path.display());
         return Ok(());
     }
     // A session recorded with an error is run again, continuing from its checkpoint.
@@ -1000,6 +1062,39 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
         }
     }
     let store = Store::open(Store::default_root())?;
+    // The squeeze-proxy arm: a proxy reachable from the task containers. Apple's
+    // runtime reaches the host at the bridge address, so bind there, not to every
+    // interface. The proxy refuses subscription credentials, as everywhere.
+    let proxy_url = if a.arms.contains(&Arm::SqueezeProxy) {
+        if runtime != atlas::Runtime::Apple {
+            bail!("the squeeze-proxy arm needs --runtime container for now");
+        }
+        if let Some(f) = &a.api_key_env_file {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(f).with_context(|| format!("--api-key-env-file {}", f.display()))?;
+            if meta.permissions().mode() & 0o077 != 0 {
+                bail!("{} is readable by other users; run `chmod 600` on it", f.display());
+            }
+        } else if auth != bench::Auth::ApiKey {
+            bail!("the squeeze-proxy arm needs an API key: --api-key-env-file (or --auth api-key)");
+        }
+        let flags = CompressFlags {
+            no_compress: false,
+            no_dedup: false,
+            prune_cold_cache: false,
+            upstream: a.proxy_upstream.clone(),
+        };
+        let proxy = Proxy::new(ProxyConfig {
+            upstream: flags.upstream(),
+            transform: flags.transform(ExpandHint::Mcp),
+            store: store.clone(),
+        })?;
+        let addr = proxy.spawn(&format!("{}:0", atlas::APPLE_HOST_ADDR)).await?;
+        eprintln!("squeeze proxy for the squeeze-proxy arm at http://{addr}");
+        Some(format!("http://{addr}"))
+    } else {
+        None
+    };
     let host = bench::Context {
         claude_bin: a.claude_bin.clone(),
         exe: std::env::current_exe()?,
@@ -1017,39 +1112,36 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
         claude_linux,
         squeeze_linux,
         token_env_file: a.token_env_file.clone(),
+        api_key_env_file: a.api_key_env_file.clone(),
+        proxy_url,
         agent_env: a.agent_env.clone(),
         cpus: a.cpus,
         memory: a.memory.clone(),
         dns: a.dns.clone(),
         judge_batch: a.judge_batch,
         defer_grading: a.defer_grading,
+        openings_dir: a.openings.clone().unwrap_or_else(|| runs_dir.join("openings")),
         runs_dir,
     };
-    let mut out = std::fs::OpenOptions::new().create(true).append(true).open(&out_path)?;
     for (n, (k, b, arm)) in todo.iter().enumerate() {
         let bundle = &file.bundles[*b];
         eprintln!("[{}/{}] {} / {} / repeat {}", n + 1, todo.len(), bundle.name, arm.name(), k + 1);
         let previous = errored(*k, *b, *arm);
-        match atlas::run_session(&ctx, &file.defaults, bundle, *arm, *k, previous.as_ref()).await {
-            Ok(r) => {
-                if let Some(e) = &r.error {
-                    eprintln!("  error: {e}");
-                }
-                if previous.is_some() {
-                    // Replace the errored row.
-                    results.retain(|x| key(x) != key(&r));
-                    results.push(r);
-                    write_results(&out_path, &results)?;
-                } else {
-                    writeln!(out, "{}", serde_json::to_string(&r)?)?;
-                    results.push(r);
-                }
-            }
-            Err(e) if e.is::<bench::LimitReached>() => {
-                eprintln!("stopped: {e}\nRerun the same command with --out {} to resume.", out_path.display());
-                break;
-            }
-            Err(e) => return Err(e),
+        let r = atlas::run_session(&ctx, &file.defaults, bundle, *arm, *k, previous.as_ref()).await?;
+        if let Some(e) = &r.error {
+            eprintln!("  error: {e}");
+        }
+        if previous.is_some() {
+            replace_result(&out_path, &r)?;
+            results.retain(|x| key(x) != key(&r));
+        } else {
+            append_result(&out_path, &r)?;
+        }
+        let limit = r.error.as_deref().is_some_and(bench::is_limit_error);
+        results.push(r);
+        if limit {
+            eprintln!("stopped by a usage limit. Rerun the same command with --out {} to resume.", out_path.display());
+            break;
         }
     }
     println!("\n{}", bench::summarize(&results));
@@ -1057,7 +1149,69 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite a results file in place (atomically).
+/// Remove every `--flag value` / `--flag=value` from `args` and return the values.
+fn take_flag(args: &mut Vec<String>, flag: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let prefix = format!("{flag}=");
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == flag && i + 1 < args.len() {
+            values.push(args.remove(i + 1));
+            args.remove(i);
+        } else if let Some(v) = args[i].strip_prefix(&prefix) {
+            values.push(v.to_string());
+            args.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    values
+}
+
+/// squeeze's text for a single-value prompt flag, followed by whatever the user
+/// passed with that flag or its `-file` form (whose file is read here).
+fn merged_prompt(args: &mut Vec<String>, flag: &str, ours: &str) -> Result<String> {
+    let mut parts = vec![ours.to_string()];
+    parts.extend(take_flag(args, flag));
+    for f in take_flag(args, &format!("{flag}-file")) {
+        parts.push(std::fs::read_to_string(&f).with_context(|| format!("{flag}-file {f}"))?);
+    }
+    Ok(parts.join("\n\n"))
+}
+
+/// Append one session's row to a results file.
+fn append_result(path: &Path, r: &bench::SessionResult) -> Result<()> {
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{}", serde_json::to_string(r)?)?;
+    Ok(())
+}
+
+/// Replace the row of `r`'s session (same bundle, arm and repeat) in a results
+/// file. Every other line stays as it was, including lines this build can't
+/// parse; the previous file is kept as `<path>.bak`.
+fn replace_result(path: &Path, r: &bench::SessionResult) -> Result<()> {
+    let old = std::fs::read_to_string(path).unwrap_or_default();
+    let mut text = String::new();
+    for line in old.lines().filter(|l| !l.trim().is_empty()) {
+        let same = serde_json::from_str::<bench::SessionResult>(line)
+            .is_ok_and(|x| x.bundle == r.bundle && x.arm == r.arm && x.repeat == r.repeat);
+        if !same {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    text.push_str(&serde_json::to_string(r)?);
+    text.push('\n');
+    if !old.is_empty() {
+        std::fs::write(PathBuf::from(format!("{}.bak", path.display())), &old)?;
+    }
+    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Write a results file we derive (`<out>.regraded.jsonl`) atomically.
 fn write_results(path: &Path, results: &[bench::SessionResult]) -> Result<()> {
     let mut text = String::new();
     for r in results {
@@ -1083,9 +1237,12 @@ fn main() {
             let mut input = String::new();
             let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
             let hint = if hint == "mcp" { ExpandHint::Mcp } else { ExpandHint::Cli };
-            if event == "post-tool-use"
-                && let Some(reply) = squeeze::hook::run(&input, hint)
-            {
+            let reply = match event.as_str() {
+                "post-tool-use" => squeeze::hook::run(&input, hint),
+                "pre-tool-use" => squeeze::hook::pre_tool_use(&input),
+                _ => None,
+            };
+            if let Some(reply) = reply {
                 println!("{reply}");
             }
             Ok(0)
@@ -1111,7 +1268,7 @@ fn main() {
                     Cmd::Run(a) => cmd_run(a).await,
                     Cmd::Proxy(a) => cmd_proxy(a).await.map(|_| 0),
                     Cmd::Bench(a) => cmd_bench(a).await.map(|_| 0),
-                    Cmd::BenchAtlas(a) => cmd_bench_atlas(a).await.map(|_| 0),
+                    Cmd::BenchAtlas(a) => cmd_bench_atlas(*a).await.map(|_| 0),
                     _ => unreachable!("handled above"),
                 }
             })
@@ -1123,5 +1280,54 @@ fn main() {
             eprintln!("squeeze: {e:#}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merges_the_users_prompt_flags_into_squeezes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("extra.md");
+        std::fs::write(&file, "FROM FILE").unwrap();
+        let mut args: Vec<String> =
+            ["-p", "do it", "--append-system-prompt", "MINE", "--append-system-prompt-file"].map(String::from).to_vec();
+        args.push(file.display().to_string());
+        args.push("--append-subagent-system-prompt=SUB".into());
+        let main = merged_prompt(&mut args, "--append-system-prompt", "OURS").unwrap();
+        let sub = merged_prompt(&mut args, "--append-subagent-system-prompt", "OURS-SUB").unwrap();
+        assert_eq!(main, "OURS\n\nMINE\n\nFROM FILE");
+        assert_eq!(sub, "OURS-SUB\n\nSUB");
+        assert_eq!(args, ["-p", "do it"], "the user's flags are taken out, everything else stays");
+    }
+
+    #[test]
+    fn replacing_a_row_keeps_every_other_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("results.jsonl");
+        let row = |arm: &str, cost: f64| {
+            json!({ "bundle": "b", "arm": arm, "repeat": 0, "model": null,
+                "agent": { "cost_usd": cost, "input_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                           "output_tokens": 0, "turns": 0, "invocations": 0, "duration_ms": 0 },
+                "helpers": { "cost_usd": 0.0, "input_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                             "output_tokens": 0, "turns": 0, "invocations": 0, "duration_ms": 0 },
+                "tickets": [], "reward": 0.0, "completed": cost > 0.0, "error": if cost > 0.0 { Value::Null } else { json!("boom") } })
+            .to_string()
+        };
+        let future = r#"{"bundle":"b","arm":"squeeze-future","repeat":0}"#;
+        std::fs::write(&path, format!("{}\n{future}\n{}\n", row("vanilla", 1.0), row("squeeze", 0.0))).unwrap();
+        let fixed: bench::SessionResult = serde_json::from_str(&row("squeeze", 2.0)).unwrap();
+        replace_result(&path, &fixed).unwrap();
+        append_result(&path, &serde_json::from_str(&row("squeeze-full", 3.0)).unwrap()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(lines.contains(&future), "a row this build can't parse survives");
+        let rows = bench::read_results(&path);
+        assert_eq!(rows.iter().filter(|r| r.arm == Arm::Squeeze).count(), 1, "the errored row was replaced");
+        assert!(rows.iter().any(|r| r.arm == Arm::SqueezeFull), "appends after a replace reach the file");
+        assert!(std::fs::read_to_string(dir.path().join("results.jsonl.bak")).unwrap().contains("boom"));
     }
 }

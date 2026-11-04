@@ -75,11 +75,20 @@ context:
 
 - `read_many`: several files or line ranges in one call, in `Read`'s `N<TAB>line` format
 - `outline`: definitions with line ranges (Rust, Python, JS/TS, Go, JVM languages, C/C++, Ruby, Markdown)
-- `search`: regex search that honors `.gitignore`, grouped by file, with a match budget
+- `search`: regex search that honors `.gitignore` (dotfiles included, version-control
+  directories skipped), grouped by file, with a match budget; without a pattern it lists files
 - `expand`: recover the original of anything squeeze compressed
-- `edit_many` (opt in with `--edit-tool`): batched exact-string edits, validated
-  before any write, allowed only on files read via `read_many` and unchanged
-  since. Claude Code asks before each use, and `/rewind` checkpoints don't track it.
+- `edit_many` (opt in with `--edit-tool`): exact-string replacements, new files
+  and full rewrites, batched in one call. Every edit is checked before any file
+  is written, and files are replaced atomically.
+  - **Read first:** an existing file must have been read with `read_many`.
+  - **Changed files:** if the file changed since that read (a formatter, a script),
+    replacements still apply where `old_string` matches exactly. Overwrites and
+    `replace_all` ask for a fresh read.
+  - **Containment:** writes stay inside the project, even through symlinks.
+  - **Permissions:** it's approved without asking only where Edit would be
+    (`acceptEdits`, `bypassPermissions`); otherwise Claude Code asks.
+  - **Rewind:** `/rewind` checkpoints don't track it.
 
 ## Install and use
 
@@ -107,11 +116,24 @@ Two opt-in flags go further:
 
   It appends short guidance for the agent and its subagents: use these tools
   instead of `cat`/`grep`/`sed` in Bash, run narrow checks, and keep replies brief.
-  The trade-off is that Read can no longer show images or PDFs. `edit_many` asks
-  before each use, as Edit does, unless you allow `mcp__squeeze__edit_many`.
+  The trade-offs:
+  - Read can no longer show images or PDFs.
+  - squeeze's tools only reach the project, so the agent reads files outside it
+    (dependency sources, saved tool output) with Bash.
+
+  `edit_many` asks for permission exactly where Edit would.
 - **`--trim-tools`** turns off Workflow, ScheduleWakeup, ReportFindings and
   ListAgents. Claude Code sends each of them in full with every request, about
   3.5k tokens together, and a coding session rarely needs them.
+- **`--compact-window TOKENS`** makes Claude Code compact the conversation within
+  that many tokens, by setting its own `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
+  - **Why it helps:** every request re-reads the whole context. On a 1M-token
+    model the default threshold is rarely reached, so long sessions keep paying
+    for history they no longer need.
+  - **When it fires:** Claude Code keeps a summary buffer, so compaction starts
+    somewhat below the window. In testing, a 120k window compacted at 100k but
+    not at 80k.
+  - **The trade-off:** a summary keeps less detail than the full history.
 
 To add only the tools to your own setup, set `alwaysLoad: true` on the server:
 
@@ -159,6 +181,7 @@ It goes beyond that methodology in a few ways:
   - `squeeze-full`: squeeze's tools *replace* Claude Code's file tools, with
     working guidance and trimmed tools (`squeeze run --replace-file-tools --trim-tools`)
   - `squeeze-scout`: `squeeze-full` plus an Explore scout on the same model
+  - `squeeze-compact`: `squeeze-full` plus earlier compaction (`--compact-window 130000`)
   - `squeeze-hook`: compression only
   - `squeeze-mcp`: tools only
   - `squeeze-proxy`: proxy compression (API key only)
@@ -235,6 +258,13 @@ runtime, the default on macOS) or `--runtime docker`. If your Mac uses a local
 DNS resolver (a VPN or filter app), containers can't resolve names: pass
 `--dns 1.1.1.1`.
 
+Every arm, vanilla included, runs the agent with Claude Code's
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`. With background commands on,
+`claude -p` can return while a command is still running. Its result then misses
+the work that follows (in our one-ticket probes, 47–80% of the cache reads), and
+the simulated user reviews a reply written mid-task. Each invocation's raw
+result is saved next to the ticket (`agent-result-N.json`) for auditing.
+
 Long runs stop sometimes. To continue one, rerun the same command with the same
 `--out`:
 
@@ -247,13 +277,24 @@ Long runs stop sometimes. To continue one, rerun the same command with the same
 - **Claude Code version:** `--claude-linux` defaults to the host's Claude Code
   version. If the host updated in the meantime, pass the original binary's
   path so both arms use the same agent version.
-- **Grading only:** `--regrade` grades what's missing, from the saved patches:
-  tests for tickets without a test score, and, with `--auth`, the judge for
-  tickets without a rubric score. Existing scores are kept, and only the judge
-  calls a model.
+- **Grading only:** `--regrade` grades what's missing, from the saved patches.
+  - **What it grades:** tests for tickets without a test score, and the judge
+    for tickets without a rubric score.
+  - **The judge needs a decision:** pass `--auth` to run it, or
+    `--judge-model none` to score the tests alone. Without one of these, it
+    won't count those tickets as rubric 1.0.
+  - **Progress is kept:** results go to `<out>.regraded.jsonl` after every session.
+    A rerun continues from there, so finished grading and paid judge calls are
+    kept. A ticket that can't be graded is marked excluded, with the reason.
 - **Faster sessions:** grading takes 10–20 minutes per ticket. `--defer-grading`
-  skips it during sessions, so they finish sooner. It doesn't change what the
-  agent does or the cost being compared. Run `--regrade --auth ...` afterwards.
+  skips it during sessions, and the summary shows those sessions' rewards as
+  pending until `--regrade`.
+  - **Agent behaviour:** unchanged.
+  - **Cost:** the gap between tickets shrinks. That doesn't matter while the
+    prompt cache outlives a grading gap: Claude Code's subscription sessions use
+    a one-hour cache, and our grafana runs read the full context from cache after
+    14–26 minute gaps. With a 5-minute cache, compare only sessions run the same
+    way. The summary flags mixed runs.
 
 Findings from setting this up:
 
@@ -283,34 +324,42 @@ Findings from setting this up:
 
 **SWE-Atlas grafana_ts** (SessionBench's TypeScript bundle: 5 refactoring
 tickets in one resumed session, Opus 5.5 as agent, simulated user and judge,
-Claude Code 2.1.317, one session per arm):
+Claude Code 2.1.317). Two sessions per arm; cost is Claude Code's own figure
+at its list prices.
 
-| | vanilla | squeeze |
+| | vanilla | squeeze (hook + MCP tools beside Claude Code's) |
 |---|---|---|
-| Agent cost (Claude Code's list-price figure) | $42.66 | $33.39 (0.78x) |
-| Turns | 164 | 158 |
-| Cache-read tokens | 27.3M | 23.4M |
-| Reward (fractional tests x rubric, mean of 5 tickets) | 0.905 | 0.878 |
-| Outputs the hook compressed | | 6 (~36 KB) |
-| Calls to squeeze's MCP tools | | 0 |
+| Agent cost, pair A | $10.32 | $9.18 (0.89x) |
+| Agent cost, pair B | $7.88 | $8.25 (1.05x) |
+| **Mean** | **$9.10** | **$8.72 (0.96x)** |
+| Reward, pair A (fractional tests x rubric) | 0.905 | 0.878 |
+| Reward, pair B (squeeze; vanilla still grading) | | 0.921 |
 
-What this does and doesn't show:
+What this shows:
 
-- **Little of the 22% gap is squeeze's own doing.**
-  - *Compression:* the 6 compressed outputs account for roughly 1M of the 3.9M
-    fewer cache-read tokens.
-  - *Replay:* `squeeze replay` on vanilla's own transcript estimates **1.6%**.
-  - *The rest is a different trajectory:* the squeeze session drew one fewer
-    pushback from the simulated user. With one session per arm, variance and
-    effect can't be separated.
-- **The MCP tools were never used** in that run. Claude Code defers MCP tools
-  behind tool search by default, so the model saw only their names. squeeze now
-  opts out of deferral (see [Install and use](#install-and-use)). In a one-ticket
-  check afterwards, Opus used `read_many` to batch file reads (3 calls, replacing
-  most `cat`/`sed` reads), but it kept searching with `grep`. Full sessions with
-  the tools visible are in progress.
-- For comparison, [Fermat's Last Token](https://www.quotientlabs.com/#how) reports
-  $60.62 → $29.79 (0.49x) on the same bundle with its own stack.
+- **No measurable saving yet.** Two vanilla sessions of the same setup differed
+  by 31%, more than any difference between the arms. A claim needs 3–5 sessions
+  per arm.
+- **squeeze's own effect is small.** The hook compressed a few outputs, worth
+  about 1–4% of cache reads. `squeeze replay` on vanilla's transcript estimates
+  1.6%.
+- **The MCP tools were rarely used.** Claude Code defers MCP tools behind tool
+  search, so the model only saw their names. squeeze now opts out of deferral.
+  Even with the tools visible, Opus kept reading and searching through Bash
+  (10 `read_many` calls against 135 Bash calls). `squeeze-full` replaces Claude
+  Code's file tools outright.
+- **A correction.** Earlier versions of this README showed costs about 4x too
+  high. Claude Code's `total_cost_usd` is a running total for the session (it
+  survives `--resume`), and the benchmark summed it over every call. The
+  benchmark now keeps the latest total and reads the session's last cost
+  snapshot from its transcript.
+- **Comparing with Fermat.** [Fermat's Last Token](https://www.quotientlabs.com/#how)
+  reports $60.62 → $29.79 (0.49x) on the same bundle (5 sessions per arm).
+  - *How:* a proxy compresses conversation history, which is where most of the
+    cost sits.
+  - *Their figures:* their harness also sums `total_cost_usd` per turn, so its
+    dollars are likely running totals too. Their token counts (cache reads at
+    0.43x of vanilla) point to a real effect.
 
 On one developer's 38 past sessions (`squeeze replay`), mostly data and infra
 work driven by shell commands, the estimated input-side saving was **0.3%** with

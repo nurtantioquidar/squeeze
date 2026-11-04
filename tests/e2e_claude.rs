@@ -371,7 +371,10 @@ rubric = "anything"
             .arg(&tasks)
             .args(["--auth", "api-key", "--repeats", "1", "--yes", "--claude-bin", &claude, "--out"])
             .arg(&results)
-            .args(["--arms", "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-hook,squeeze-mcp,squeeze-proxy"])
+            .args([
+                "--arms",
+                "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-hook,squeeze-mcp,squeeze-proxy",
+            ])
             .args(extra)
             .env("ANTHROPIC_API_KEY", FAKE_KEY)
             .env("ANTHROPIC_BASE_URL", mock.url())
@@ -390,7 +393,7 @@ rubric = "anything"
 
     let rows: Vec<Value> =
         std::fs::read_to_string(&results).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(rows.len(), 7, "one session per arm");
+    assert_eq!(rows.len(), 8, "one session per arm");
     let mut pushbacks = 0;
     for r in &rows {
         assert!(r["error"].is_null(), "{r}");
@@ -636,8 +639,9 @@ async fn squeeze_run_replace_file_tools() {
         .current_dir(&work)
         .args(["run", "--quiet", "--replace-file-tools", "--trim-tools", "--claude-bin", &claude, "--"])
         .args(["-p", "Change hello to goodbye and add src/new.txt.", "--output-format", "json"])
-        // edit_many asks before each use, like Edit; a script pre-approves it.
-        .args(["--model", "claude-mock", "--allowedTools", "Bash", "mcp__squeeze__edit_many", "--strict-mcp-config"])
+        // edit_many is approved without asking exactly when Edit would be: here, in acceptEdits.
+        .args(["--permission-mode", "acceptEdits", "--append-system-prompt", "USER-PROMPT-MARKER"])
+        .args(["--model", "claude-mock", "--allowedTools", "Bash", "--strict-mcp-config"])
         .env("ANTHROPIC_BASE_URL", mock.url())
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
         .env("ENABLE_TOOL_SEARCH", "true")
@@ -676,12 +680,48 @@ async fn squeeze_run_replace_file_tools() {
     for tool in ["mcp__squeeze__read_many", "mcp__squeeze__edit_many", "mcp__squeeze__search"] {
         assert!(names.contains(&tool), "{tool} not sent in full: {names:?}");
     }
-    assert!(first["system"].to_string().contains("turned off in this session"), "guidance in the system prompt");
+    let system = first["system"].to_string();
+    assert!(system.contains("turned off in this session"), "guidance in the system prompt");
+    assert!(system.contains("USER-PROMPT-MARKER"), "the user's own --append-system-prompt is kept");
 
     let last = main.iter().max_by_key(|b| assistant_turns(b)).unwrap();
     let edit = tool_result_text(last, "toolu_full_edit").unwrap();
-    assert!(edit.contains("hello.txt: 1 edit(s) applied at line(s) 1"), "{edit}");
+    assert!(edit.contains("hello.txt: 1 replacement(s) at line(s) 1"), "{edit}");
     assert!(edit.contains("src/new.txt: created (1 lines)"), "{edit}");
     assert_eq!(std::fs::read_to_string(work.join("hello.txt")).unwrap(), "goodbye from squeeze\n");
     assert_eq!(std::fs::read_to_string(work.join("src/new.txt")).unwrap(), "created by edit_many\n");
+}
+
+/// In the default permission mode, edit_many needs approval like Edit: `-p`
+/// can't ask, so the edit is denied and nothing changes on disk.
+#[tokio::test]
+#[ignore = "needs the claude CLI; run with --ignored"]
+async fn edit_many_asks_like_edit_in_the_default_mode() {
+    let claude = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("hello.txt"), "hello from squeeze\n").unwrap();
+    let mock = common::start(Arc::new(full_tools_script)).await;
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_squeeze"))
+        .current_dir(&work)
+        .args(["run", "--quiet", "--replace-file-tools", "--claude-bin", &claude, "--"])
+        .args(["-p", "Change hello to goodbye.", "--output-format", "json"])
+        .args(["--model", "claude-mock", "--allowedTools", "Bash", "--strict-mcp-config"])
+        .env("ANTHROPIC_BASE_URL", mock.url())
+        .env("ANTHROPIC_API_KEY", FAKE_KEY)
+        .env("SQUEEZE_HOME", tmp.path().join("squeeze-home"))
+        .env("CLAUDE_CONFIG_DIR", tmp.path().join("claude-config"))
+        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+        .env("DISABLE_AUTOUPDATER", "1")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .stdin(Stdio::null())
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(180), out).await.expect("timed out").unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let result: Value = serde_json::from_str(stdout.trim()).expect("claude JSON output");
+    let denied = result["permission_denials"].to_string();
+    assert!(denied.contains("mcp__squeeze__edit_many"), "{result}");
+    assert_eq!(std::fs::read_to_string(work.join("hello.txt")).unwrap(), "hello from squeeze\n");
 }
