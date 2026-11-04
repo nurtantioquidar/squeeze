@@ -96,6 +96,23 @@ squeeze stats                        # what squeeze has compressed
 pre-approval of squeeze's read-only tools) and `--mcp-config`. It does not edit
 your settings files. If you pass your own `--settings`, squeeze merges into it.
 
+Two opt-in flags go further:
+
+- **`--replace-file-tools`** turns off Claude Code's Read, Edit, Write, Grep and
+  Glob, and hands file access to squeeze's tools:
+  - `read_many` (several files and ranges per call)
+  - `search` (grouped results, file lists)
+  - `outline`
+  - `edit_many` (batched edits, new files, full rewrites)
+
+  It appends short guidance for the agent and its subagents: use these tools
+  instead of `cat`/`grep`/`sed` in Bash, run narrow checks, and keep replies brief.
+  The trade-off is that Read can no longer show images or PDFs. `edit_many` asks
+  before each use, as Edit does, unless you allow `mcp__squeeze__edit_many`.
+- **`--trim-tools`** turns off Workflow, ScheduleWakeup, ReportFindings and
+  ListAgents. Claude Code sends each of them in full with every request, about
+  3.5k tokens together, and a coding session rarely needs them.
+
 To add only the tools to your own setup, set `alwaysLoad: true` on the server:
 
 ```json
@@ -136,8 +153,15 @@ for Fermat ([akuik/sessionbench-swe](https://github.com/akuik/sessionbench-swe))
 It goes beyond that methodology in a few ways:
 
 - **Ablation arms.** SessionBench compared only the whole stack against vanilla.
-  Here you can choose `vanilla`, `squeeze` (hook + MCP), `squeeze-hook`
-  (compression only), `squeeze-mcp` (tools only) and `squeeze-proxy` (API key only).
+  Here you can choose among:
+  - `vanilla`
+  - `squeeze`: hook + MCP tools, alongside Claude Code's own tools
+  - `squeeze-full`: squeeze's tools *replace* Claude Code's file tools, with
+    working guidance and trimmed tools (`squeeze run --replace-file-tools --trim-tools`)
+  - `squeeze-scout`: `squeeze-full` plus an Explore scout on the same model
+  - `squeeze-hook`: compression only
+  - `squeeze-mcp`: tools only
+  - `squeeze-proxy`: proxy compression (API key only)
 - **A paired bootstrap 95% CI** on the cost ratio.
 - **Resume after a usage limit.** Rerun the same command and finished sessions
   are skipped.
