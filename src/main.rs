@@ -281,6 +281,23 @@ struct ReplayArgs {
     /// With --cache-sim: as `squeeze proxy --clear-thinking`
     #[arg(long, value_name = "BOOL", default_value_t = true, action = clap::ArgAction::Set, requires = "cache_sim")]
     clear_thinking: bool,
+    /// With --cache-sim: model compaction at pauses instead of context edits: during each
+    /// pause before a human prompt, while the cache is warm, the history is summarized into
+    /// this many tokens, which stand in for it from then on ("advances" counts compactions)
+    #[arg(long, value_name = "TOKENS", requires = "cache_sim")]
+    compact_summary: Option<f64>,
+    /// With --compact-summary: compact only a history at least this many tokens long
+    #[arg(long, value_name = "TOKENS", default_value_t = 20_000.0, requires = "compact_summary")]
+    compact_min: f64,
+    /// With --compact-summary: thinking the summarizing request spends, as a share of the summary
+    #[arg(long, value_name = "FRACTION", default_value_t = 0.5, requires = "compact_summary")]
+    compact_thinking: f64,
+    /// With --compact-summary: share of the summarized tool results the agent reads back later
+    #[arg(long, value_name = "FRACTION", default_value_t = 0.1, requires = "compact_summary")]
+    compact_reread: f64,
+    /// With --compact-summary: compact only at pauses before a new ticket
+    #[arg(long, requires = "compact_summary")]
+    compact_tickets_only: bool,
 }
 
 #[derive(Args)]
@@ -865,6 +882,13 @@ fn cmd_cache_sim(a: &ReplayArgs, files: &[PathBuf]) -> Result<()> {
             clear_inputs: a.clear_tool_inputs,
             clear_thinking: a.clear_thinking,
         },
+        compact: a.compact_summary.map(|summary| cachesim::Compaction {
+            summary,
+            min_history: a.compact_min,
+            thinking: a.compact_thinking,
+            reread: a.compact_reread,
+            tickets_only: a.compact_tickets_only,
+        }),
     };
     let sim = cachesim::simulate_files(files, &cfg)?;
     if a.json {
@@ -875,6 +899,16 @@ fn cmd_cache_sim(a: &ReplayArgs, files: &[PathBuf]) -> Result<()> {
         Regime::FiveMinFermat => "5m-fermat: 5-minute cache, 330 s pauses",
         Regime::OneHour => "1h: 1-hour cache, recorded timing",
     };
+    if let Some(c) = &cfg.compact {
+        println!(
+            "Compaction at pauses: {:.0}-token summaries of histories from {:.0} tokens, {:.0}% thinking on top,\n\
+             {:.0}% of summarized tool results read back. (The context-edit settings below don't apply.)",
+            c.summary,
+            c.min_history,
+            100.0 * c.thinking,
+            100.0 * c.reread
+        );
+    }
     println!(
         "Cache simulation ({regime}). --context-edits cold keeping {}-{} tool uses, inputs {}, thinking {};\n\
          placeholder {} tokens, {:.0}% of each cleared result read back.",

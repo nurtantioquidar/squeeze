@@ -288,7 +288,14 @@ async fn replay_matches_the_simulator(clear_inputs: bool) {
         server::tokens(&json!({ "type": "tool_use", "input": { "cleared": server::INPUT_PLACEHOLDER } })),
         placeholder
     );
-    let cfg = SimConfig { regime: Regime::FiveMinFermat, read_price: Some(0.1), reread: 0.0, placeholder, ctx };
+    let cfg = SimConfig {
+        regime: Regime::FiveMinFermat,
+        read_price: Some(0.1),
+        reread: 0.0,
+        placeholder,
+        ctx,
+        compact: None,
+    };
     let sim = cachesim::simulate_files(std::slice::from_ref(&path), &cfg).unwrap();
     let s = &sim.sessions[0];
     let requests = cachesim::rebuild(&path, Regime::FiveMinFermat).unwrap().expect("requests logged");

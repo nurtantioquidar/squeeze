@@ -91,7 +91,34 @@ pub struct SimConfig {
     /// Tokens the server leaves in place of a cleared tool result or input.
     pub placeholder: f64,
     pub ctx: CtxConfig,
+    /// Model compaction at pauses instead of `--context-edits cold`.
+    pub compact: Option<Compaction>,
 }
+
+/// Compaction at pauses (Stage 3 of the proxy plan), as a proxy could do it:
+/// when a request leaves the conversation idle long enough to suggest a pause,
+/// the proxy has the history summarized while the prompt cache is still warm
+/// (the summarizing request reads it at the read price), and from the next
+/// human prompt on sends the summary in its place. The current turn always
+/// goes verbatim, and each later pause summarizes again, summary included.
+#[derive(Clone, Copy, Debug)]
+pub struct Compaction {
+    /// Tokens of each summary.
+    pub summary: f64,
+    /// Compact only a history at least this many tokens long.
+    pub min_history: f64,
+    /// Thinking the summarizing request spends, as a share of the summary.
+    pub thinking: f64,
+    /// Share of the summarized tool results the agent reads back later.
+    pub reread: f64,
+    /// Compact only at pauses before a new ticket, not mid-ticket ones.
+    pub tickets_only: bool,
+}
+
+/// The summarizing request goes out this long before the cache would expire.
+const COMPACT_LEAD_SECS: f64 = 60.0;
+/// Tokens of the instruction the summarizing request appends.
+const COMPACT_INSTRUCTION_TOKENS: f64 = 300.0;
 
 /// The hash Claude Code logs a message under: sha256 of compact JSON with
 /// sorted keys and non-ASCII text left as is.
@@ -974,6 +1001,73 @@ fn simulate(s: &Session, cal: &Calibration, cfg: &SimConfig, edits: bool) -> Run
     run
 }
 
+/// Replay a session's requests with [`Compaction`] at each pause before a
+/// human prompt. `advances` counts the compactions.
+fn simulate_compaction(s: &Session, cal: &Calibration, cfg: &SimConfig, comp: &Compaction) -> Run {
+    let ttl = cfg.regime.ttl();
+    let times = timeline(s, cfg.regime);
+    let mut cache = Cache { ttl, expiry: HashMap::new() };
+    let mut run = Run::default();
+    let unit = |i: usize| (mix(i as u64, 0), cal.msg_tokens(&s.msgs[i]));
+    // The summary in force: the messages it stands for, and its cache unit.
+    let mut summary: Option<(Vec<usize>, (u64, f64))> = None;
+    // A request's messages as the proxy sends them.
+    let units = |msgs: &[usize], summary: &Option<(Vec<usize>, (u64, f64))>| -> Vec<(u64, f64)> {
+        match summary {
+            Some((covered, u)) if msgs.starts_with(covered) => {
+                std::iter::once(*u).chain(msgs[covered.len()..].iter().map(|&i| unit(i))).collect()
+            }
+            _ => msgs.iter().map(|&i| unit(i)).collect(),
+        }
+    };
+    let bill = |cache: &mut Cache, b: &mut Bill, t: f64, us: &[(u64, f64)], prev: &[u64]| {
+        let keys: Vec<u64> = us.iter().map(|u| u.0).collect();
+        let (hs, hit) = cache.lookup(t, &keys);
+        let shared = prev.iter().zip(&keys).take_while(|(a, b)| a == b).count();
+        let split = hit.map_or(0, |k| k + 1);
+        b.cache_read += s.sys_tokens + us[..split].iter().map(|u| u.1).sum::<f64>();
+        b.cache_write += us[split..].iter().map(|u| u.1).sum::<f64>();
+        cache.touch(t, &hs, hit, shared.checked_sub(1));
+        keys
+    };
+    let mut prev: Option<(f64, Vec<u64>)> = None;
+    for (c, &t) in s.calls.iter().zip(&times) {
+        let idle = prev.as_ref().map(|(lt, _)| t - lt);
+        run.cold += usize::from(idle.is_some_and(|g| g > ttl));
+        if !summary.as_ref().is_none_or(|(covered, _)| c.msgs.starts_with(covered)) {
+            summary = None; // Claude Code compacted or rewound the history itself.
+        }
+        let paused = c.human && idle.is_some_and(|g| g > ttl) && (c.ticket || !comp.tickets_only);
+        let at = c.msgs.iter().rposition(|&i| s.msgs[i].prompt_chars.is_some()).unwrap_or(c.msgs.len());
+        if paused && let Some((lt, prev_keys)) = &prev {
+            let history = units(&c.msgs[..at], &summary);
+            if history.iter().map(|u| u.1).sum::<f64>() >= comp.min_history {
+                // Summarize while the previous request's prefix is still cached.
+                let mut req = history.clone();
+                req.push((mix(u64::MAX, run.advances as u64), COMPACT_INSTRUCTION_TOKENS));
+                bill(&mut cache, &mut run.bill, lt + ttl - COMPACT_LEAD_SECS, &req, prev_keys);
+                run.bill.output += comp.summary * (1.0 + comp.thinking);
+                let before = summary.as_ref().map_or(0, |(covered, _)| covered.len());
+                let results: f64 = c.msgs[before..at]
+                    .iter()
+                    .flat_map(|&i| &s.msgs[i].blocks)
+                    .filter(|b| b.kind == Kind::Result)
+                    .map(|b| cal.tokens(b))
+                    .sum();
+                let key = mix(u64::MAX - 1, c.msgs[at - 1] as u64);
+                summary = Some((c.msgs[..at].to_vec(), (key, comp.summary + comp.reread * results)));
+                run.advances += 1;
+            }
+        }
+        let us = units(&c.msgs, &summary);
+        let keys = bill(&mut cache, &mut run.bill, t, &us, prev.as_ref().map_or(&[][..], |p| &p.1));
+        run.bill.input += c.input;
+        run.bill.output += c.output;
+        prev = Some((t, keys));
+    }
+    run
+}
+
 /// One session, sent as is and with `--context-edits cold`.
 #[derive(Debug, Serialize)]
 pub struct SessionSim {
@@ -1051,7 +1145,11 @@ pub fn simulate_files(files: &[PathBuf], cfg: &SimConfig) -> Result<CacheSim> {
             b.cost = read * b.cache_read + cfg.regime.write_price() * b.cache_write + b.input + OUTPUT_PRICE * b.output;
         };
         let read = cfg.read_price.unwrap_or_else(|| read_price(&s.model));
-        let (mut base, mut cm) = (simulate(&s, &calibration, cfg, false), simulate(&s, &calibration, cfg, true));
+        let mut base = simulate(&s, &calibration, cfg, false);
+        let mut cm = match &cfg.compact {
+            Some(comp) => simulate_compaction(&s, &calibration, cfg, comp),
+            None => simulate(&s, &calibration, cfg, true),
+        };
         price(&mut base.bill, read);
         price(&mut cm.bill, read);
         let fit_error = s
@@ -1222,7 +1320,41 @@ mod tests {
             reread: 0.0,
             placeholder: 60.0,
             ctx: CtxConfig { window: KeepWindow { min: 4, max: 4 }, clear_inputs: true, clear_thinking: true },
+            compact: None,
         }
+    }
+
+    #[test]
+    fn compaction_at_pauses_replaces_the_history_with_the_summary() {
+        let mut s = loaded(&session_log(5, 10, 20.0));
+        prepare(&mut s, &FLAT);
+        let cost = |run: &Run| {
+            let b = &run.bill;
+            0.1 * b.cache_read + 1.25 * b.cache_write + b.input + OUTPUT_PRICE * b.output
+        };
+        let cfg = cfg(Regime::FiveMinFermat);
+        let base = simulate(&s, &FLAT, &cfg, false);
+        let comp = |summary: f64, min_history: f64| Compaction {
+            summary,
+            min_history,
+            thinking: 0.5,
+            reread: 0.1,
+            tickets_only: false,
+        };
+        let small = simulate_compaction(&s, &FLAT, &cfg, &comp(500.0, 1000.0));
+        // Pauses before the second follow-up and the fifth (every third human turn).
+        assert_eq!((base.cold, small.cold, small.advances), (2, 2, 2));
+        assert!(cost(&small) < 0.8 * cost(&base), "{} vs {}", cost(&small), cost(&base));
+        assert!(small.bill.output > base.bill.output, "the summaries are output");
+        // A summary as big as the history saves nothing; a high minimum never compacts.
+        let huge = simulate_compaction(&s, &FLAT, &cfg, &comp(1e7, 1000.0));
+        assert!(cost(&huge) > cost(&base));
+        let never = simulate_compaction(&s, &FLAT, &cfg, &comp(500.0, 1e9));
+        assert_eq!(never.advances, 0);
+        assert!((cost(&never) - cost(&base)).abs() < 1e-6, "without compaction it's the session as sent");
+        // The pauses here are follow-ups, not new tickets.
+        let tickets = simulate_compaction(&s, &FLAT, &cfg, &Compaction { tickets_only: true, ..comp(500.0, 1000.0) });
+        assert_eq!(tickets.advances, 0);
     }
 
     #[test]
