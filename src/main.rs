@@ -335,6 +335,11 @@ struct AtlasArgs {
     /// judge keep --auth, so only the proxied agent's tokens are billed to the key.
     #[arg(long)]
     api_key_env_file: Option<PathBuf>,
+    /// Run up to this many sessions at once, each in its own containers (size --cpus and
+    /// --memory so they fit together). Sessions start in order, so with 2 the arms of a
+    /// repeat run side by side.
+    #[arg(long, default_value_t = 1)]
+    parallel: usize,
     /// Every arm's agent uses --api-key-env-file, not only the proxied arms', so all arms
     /// run at API prices and the same cache lifetime. The simulated user and the judge
     /// keep --auth, and --token-env-file is not needed.
@@ -1163,6 +1168,7 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
             token_env_file: None,
             api_key_env_file: None,
             api_key_all_arms: false,
+            openings_lock: Default::default(),
             proxy_urls: BTreeMap::new(),
             agent_env: Vec::new(),
             cache_ttl: a.cache_ttl,
@@ -1337,6 +1343,7 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
         token_env_file: a.token_env_file.clone(),
         api_key_env_file: a.api_key_env_file.clone(),
         api_key_all_arms: a.api_key_all_arms,
+        openings_lock: Default::default(),
         proxy_urls,
         agent_env: a.agent_env.clone(),
         cache_ttl: a.cache_ttl,
@@ -1348,26 +1355,50 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
         openings_dir: a.openings.clone().unwrap_or_else(|| runs_dir.join("openings")),
         runs_dir,
     };
-    for (n, (k, b, arm)) in todo.iter().enumerate() {
-        let bundle = &file.bundles[*b];
-        eprintln!("[{}/{}] {} / {} / repeat {}", n + 1, todo.len(), bundle.name, arm.name(), k + 1);
-        let previous = errored(*k, *b, *arm);
-        let r = atlas::run_session(&ctx, &file.defaults, bundle, *arm, *k, previous.as_ref()).await?;
-        if let Some(e) = &r.error {
-            eprintln!("  error: {e}");
+    // Up to --parallel sessions at once. On a usage limit or a failure no new
+    // session starts, and the running ones finish (and checkpoint) first.
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+    let mut queue = todo.iter().enumerate();
+    let mut running = FuturesUnordered::new();
+    let (mut stop, mut failure) = (false, None);
+    loop {
+        while !stop && running.len() < a.parallel.max(1) {
+            let Some((n, &(k, b, arm))) = queue.next() else { break };
+            let bundle = &file.bundles[b];
+            eprintln!("[{}/{}] {} / {} / repeat {}", n + 1, todo.len(), bundle.name, arm.name(), k + 1);
+            let previous = errored(k, b, arm);
+            let (ctx, d) = (&ctx, &file.defaults);
+            running.push(async move {
+                let r = atlas::run_session(ctx, d, bundle, arm, k, previous.as_ref()).await;
+                (previous.is_some(), r)
+            });
         }
-        if previous.is_some() {
+        let Some((replaces, r)) = running.next().await else { break };
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("  failed: {e:#}");
+                (stop, failure) = (true, failure.or(Some(e)));
+                continue;
+            }
+        };
+        if let Some(e) = &r.error {
+            eprintln!("  error ({} / repeat {}): {e}", r.arm.name(), r.repeat + 1);
+        }
+        if replaces {
             replace_result(&out_path, &r)?;
             results.retain(|x| key(x) != key(&r));
         } else {
             append_result(&out_path, &r)?;
         }
-        let limit = r.error.as_deref().is_some_and(bench::is_limit_error);
-        results.push(r);
-        if limit {
+        if r.error.as_deref().is_some_and(bench::is_limit_error) && !stop {
+            stop = true;
             eprintln!("stopped by a usage limit. Rerun the same command with --out {} to resume.", out_path.display());
-            break;
         }
+        results.push(r);
+    }
+    if let Some(e) = failure {
+        return Err(e);
     }
     println!("\n{}", bench::summarize(&results));
     println!("Results: {}", out_path.display());

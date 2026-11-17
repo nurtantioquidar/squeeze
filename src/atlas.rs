@@ -270,6 +270,9 @@ pub struct AtlasCtx<'a> {
     /// Every arm's agent uses `api_key_env_file`, so arms compare at the same
     /// prices and cache lifetime. The simulated user and judge keep `--auth`.
     pub api_key_all_arms: bool,
+    /// Held while a ticket's shared opening is read or written, so sessions
+    /// running side by side write it once and both use it.
+    pub openings_lock: tokio::sync::Mutex<()>,
     /// The squeeze proxy each proxied arm reaches from the containers.
     pub proxy_urls: BTreeMap<Arm, String>,
     /// Extra KEY=VALUE environment for the agent (e.g. a gateway URL).
@@ -467,7 +470,13 @@ async fn session_inner(
             res.tickets = cp.session.tickets;
             started = cp.started;
             pending = cp.pending;
-            eprintln!("    resuming session {sid} after ticket {} of {}", res.tickets.len(), bundle.tasks.len());
+            eprintln!(
+                "    [{} r{}] resuming session {sid} after ticket {} of {}",
+                res.arm.name(),
+                res.repeat + 1,
+                res.tickets.len(),
+                bundle.tasks.len()
+            );
         }
         Err(_) if transcript_bytes(&cfg_dir, &sid) > 0 => {
             bail!("this session has an agent transcript but no checkpoint, so it can't resume; {}", rerun_hint());
@@ -550,7 +559,7 @@ async fn session_inner(
         let task = load_task(&ctx.root, task_id)?;
         let tdir = sdir.join("tickets").join(format!("{}-{}", i + 1, task_id));
         std::fs::create_dir_all(&tdir)?;
-        eprintln!("    ticket {}/{}: {task_id}", i + 1, bundle.tasks.len());
+        eprintln!("    [{} r{}] ticket {}/{}: {task_id}", res.arm.name(), res.repeat + 1, i + 1, bundle.tasks.len());
         ctx.runtime.pull(&task.image).await?;
         let (mut tr, patch) = match pending.take().filter(|p| p.id == *task_id) {
             Some(tr) => {
@@ -590,7 +599,7 @@ async fn session_inner(
             }
         };
         if ctx.defer_grading {
-            eprintln!("      grading deferred (run --regrade later)");
+            eprintln!("      [{} r{}] grading deferred (run --regrade later)", res.arm.name(), res.repeat + 1);
             tr.excluded = Some(bench::GRADING_DEFERRED.into());
             res.tickets.push(tr);
             save_checkpoint(sdir, &cfg_dir, res, started, None)?;
@@ -598,7 +607,9 @@ async fn session_inner(
         }
         grade(ctx, d, bundle, &task, &patch, &tdir, &mut tr, &mut res.helpers).await?;
         eprintln!(
-            "      tests {} x rubric {} = {:.3}{}",
+            "      [{} r{}] tests {} x rubric {} = {:.3}{}",
+            res.arm.name(),
+            res.repeat + 1,
             tr.tests_frac.map_or("-".into(), |t| format!("{t:.3}")),
             tr.rubric.map_or("-".into(), |r| format!("{r:.3}")),
             tr.reward,
@@ -737,6 +748,7 @@ async fn run_ticket(
     };
     let opening =
         ctx.openings_dir.join(&bundle.name).join(format!("r{}", res.repeat + 1)).join(format!("{}.txt", task.id));
+    let openings = ctx.openings_lock.lock().await;
     let mut message = match (d.usersim_model.as_deref(), std::fs::read_to_string(&opening)) {
         (Some(_), Ok(shared)) if !shared.trim().is_empty() => shared,
         (Some(m), _) => {
@@ -756,6 +768,7 @@ async fn run_ticket(
         }
         (None, _) => task.instruction.clone(),
     };
+    drop(openings);
     let timeout = d.timeout_secs.unwrap_or(10_800);
     let mut conversation: Vec<String> = Vec::new();
     loop {
@@ -1171,6 +1184,7 @@ mod tests {
             token_env_file: Some(PathBuf::from("/cfg/token.env")),
             api_key_env_file: Some(PathBuf::from("/cfg/api.env")),
             api_key_all_arms: all_arms,
+            openings_lock: Default::default(),
             proxy_urls: BTreeMap::new(),
             agent_env: Vec::new(),
             cache_ttl: CacheTtl::Client,
