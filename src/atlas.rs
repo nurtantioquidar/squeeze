@@ -231,6 +231,9 @@ pub struct AtlasCtx<'a> {
     /// Env file with ANTHROPIC_API_KEY for the proxied arms' agent (the proxy
     /// accepts API keys only). Passed by path only; other arms keep `--auth`.
     pub api_key_env_file: Option<PathBuf>,
+    /// Every arm's agent uses `api_key_env_file`, so arms compare at the same
+    /// prices and cache lifetime. The simulated user and judge keep `--auth`.
+    pub api_key_all_arms: bool,
     /// The squeeze proxy each proxied arm reaches from the containers.
     pub proxy_urls: BTreeMap<Arm, String>,
     /// Extra KEY=VALUE environment for the agent (e.g. a gateway URL).
@@ -406,7 +409,7 @@ async fn session_inner(
         if ctx.api_key_env_file.is_none() && ctx.host.auth != Auth::ApiKey {
             bail!("the {} arm needs an API key: --api-key-env-file, or --auth api-key", arm.name());
         }
-    } else if ctx.host.auth == Auth::Subscription && ctx.token_env_file.is_none() {
+    } else if ctx.host.auth == Auth::Subscription && ctx.token_env_file.is_none() && !ctx.api_key_all_arms {
         bail!("subscription runs inside containers need --token-env-file (a `claude setup-token` token)");
     }
     let sid = res.session_id.clone();
@@ -634,11 +637,12 @@ fn exec_cmd(
     let mut c = Command::new(ctx.runtime.bin());
     c.args(["exec", "-i"]);
     let set_here = |k: &str| env.iter().any(|(e, _)| *e == k);
-    // Going through the squeeze proxy: the agent authenticates with the API key
-    // file, and never gets the subscription token (the proxy refuses it anyway).
+    // Going through the squeeze proxy (or every arm on the key): the agent
+    // authenticates with the API key file, and never gets the subscription
+    // token (the proxy refuses it anyway).
     let proxied = set_here("ANTHROPIC_BASE_URL");
     match (&ctx.api_key_env_file, ctx.host.auth) {
-        (Some(f), _) if proxied => {
+        (Some(f), _) if proxied || ctx.api_key_all_arms => {
             c.arg("--env-file").arg(f);
         }
         (_, Auth::Subscription) => {
@@ -1108,6 +1112,51 @@ mod tests {
         std::fs::write(project.join(format!("{sid}.jsonl")), "{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n")
             .unwrap();
         assert_ne!(transcript_bytes(&cfg, sid), cp.transcript_bytes);
+    }
+
+    #[test]
+    fn agents_get_the_api_key_file_only_when_proxied_or_all_arms() {
+        let host = bench::Context {
+            claude_bin: "claude".into(),
+            exe: PathBuf::from("/bin/squeeze"),
+            store_root: PathBuf::from("/tmp/store"),
+            auth: Auth::Subscription,
+            proxy_urls: BTreeMap::new(),
+            model_override: None,
+            include_user_settings: false,
+            keep_dirs: false,
+        };
+        let ctx = |all_arms: bool| AtlasCtx {
+            host: &host,
+            runtime: Runtime::Apple,
+            root: PathBuf::new(),
+            claude_linux: PathBuf::new(),
+            squeeze_linux: PathBuf::new(),
+            token_env_file: Some(PathBuf::from("/cfg/token.env")),
+            api_key_env_file: Some(PathBuf::from("/cfg/api.env")),
+            api_key_all_arms: all_arms,
+            proxy_urls: BTreeMap::new(),
+            agent_env: Vec::new(),
+            cache_ttl: CacheTtl::Client,
+            cpus: 1,
+            memory: "1g".into(),
+            dns: Vec::new(),
+            judge_batch: false,
+            defer_grading: true,
+            runs_dir: PathBuf::new(),
+            openings_dir: PathBuf::new(),
+        };
+        let env_file = |ctx: &AtlasCtx<'_>, env: &[(&str, String)]| {
+            let c = exec_cmd(ctx, "box", "/w", None, env);
+            let args: Vec<String> = c.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+            args.iter().position(|a| a == "--env-file").map(|i| args[i + 1].clone())
+        };
+        let proxied = [("ANTHROPIC_BASE_URL", "http://h:1".to_string())];
+        let (some, all) = (ctx(false), ctx(true));
+        assert_eq!(env_file(&some, &proxied).as_deref(), Some("/cfg/api.env"));
+        assert_eq!(env_file(&some, &[]).as_deref(), Some("/cfg/token.env"), "vanilla stays on the subscription");
+        assert_eq!(env_file(&all, &[]).as_deref(), Some("/cfg/api.env"), "every arm on the key");
+        assert_eq!(env_file(&all, &proxied).as_deref(), Some("/cfg/api.env"));
     }
 
     #[test]

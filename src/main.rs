@@ -335,6 +335,11 @@ struct AtlasArgs {
     /// judge keep --auth, so only the proxied agent's tokens are billed to the key.
     #[arg(long)]
     api_key_env_file: Option<PathBuf>,
+    /// Every arm's agent uses --api-key-env-file, not only the proxied arms', so all arms
+    /// run at API prices and the same cache lifetime. The simulated user and the judge
+    /// keep --auth, and --token-env-file is not needed.
+    #[arg(long, requires = "api_key_env_file")]
+    api_key_all_arms: bool,
     /// Where the proxied arms' proxies forward to [default: Anthropic's API]
     #[arg(long)]
     proxy_upstream: Option<String>,
@@ -1075,6 +1080,9 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
         _ if a.regrade && a.auth.is_none() => {}
         // The judge runs on the host's own Claude Code login; no token file needed.
         bench::Auth::Subscription if a.regrade => {}
+        // Every agent uses the API key file (checked below); the simulated user and the
+        // judge run on the host's own Claude Code login.
+        bench::Auth::Subscription if a.api_key_all_arms => {}
         bench::Auth::Subscription => {
             let f = a.token_env_file.as_ref().context(
                 "subscription runs need --token-env-file: a file with CLAUDE_CODE_OAUTH_TOKEN=... from `claude setup-token`",
@@ -1154,6 +1162,7 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
             squeeze_linux,
             token_env_file: None,
             api_key_env_file: None,
+            api_key_all_arms: false,
             proxy_urls: BTreeMap::new(),
             agent_env: Vec::new(),
             cache_ttl: a.cache_ttl,
@@ -1266,6 +1275,15 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
             bail!("cancelled");
         }
     }
+    if a.api_key_all_arms
+        && let Some(f) = &a.api_key_env_file
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(f).with_context(|| format!("--api-key-env-file {}", f.display()))?;
+        if meta.permissions().mode() & 0o077 != 0 {
+            bail!("{} is readable by other users; run `chmod 600` on it", f.display());
+        }
+    }
     let store = Store::open(Store::default_root())?;
     // Proxied arms: a proxy each, reachable from the task containers. Apple's
     // runtime reaches the host at the bridge address, so bind there, not to every
@@ -1308,6 +1326,7 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
         squeeze_linux,
         token_env_file: a.token_env_file.clone(),
         api_key_env_file: a.api_key_env_file.clone(),
+        api_key_all_arms: a.api_key_all_arms,
         proxy_urls,
         agent_env: a.agent_env.clone(),
         cache_ttl: a.cache_ttl,
@@ -1514,6 +1533,8 @@ mod tests {
         let t = cm.transform(ExpandHint::Mcp).unwrap().unwrap();
         assert_eq!((t.ctx_window, t.prune.enabled), (Some(ctx.window), false));
         assert_eq!(cm.upstream(), "http://u");
+        let inputs = CompressFlags::for_arm(Arm::SqueezeProxyCmInputs, None).unwrap().ctx().unwrap().unwrap();
+        assert_eq!((inputs.window, inputs.clear_inputs, inputs.clear_thinking), (KeepWindow::default(), true, true));
         let plain = CompressFlags::for_arm(Arm::SqueezeProxy, None).unwrap();
         assert_eq!(plain.ctx().unwrap(), None);
         assert_eq!(plain.transform(ExpandHint::Mcp).unwrap().unwrap().ctx_window, None);

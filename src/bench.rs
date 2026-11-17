@@ -132,6 +132,9 @@ pub enum Arm {
     /// squeeze-proxy plus server-side context editing at cold-cache moments
     /// (`squeeze proxy --context-edits cold`, API key only).
     SqueezeProxyCm,
+    /// squeeze-proxy-cm that also clears the agent's older tool inputs
+    /// (`--clear-tool-inputs`), e.g. the text of earlier Edit/Write calls.
+    SqueezeProxyCmInputs,
     /// Hook compression + MCP tools that replace Claude Code's file tools
     /// (Read/Edit/Write/Grep/Glob turned off), working guidance, and unused
     /// built-in tools trimmed (`squeeze run --replace-file-tools --trim-tools`).
@@ -162,6 +165,7 @@ impl Arm {
             Arm::SqueezeMcp => "squeeze-mcp",
             Arm::SqueezeProxy => "squeeze-proxy",
             Arm::SqueezeProxyCm => "squeeze-proxy-cm",
+            Arm::SqueezeProxyCmInputs => "squeeze-proxy-cm-inputs",
             Arm::SqueezeFull => "squeeze-full",
             Arm::SqueezeScout => "squeeze-scout",
             Arm::SqueezeCompact => "squeeze-compact",
@@ -175,6 +179,7 @@ impl Arm {
                 | Arm::SqueezeMcp
                 | Arm::SqueezeProxy
                 | Arm::SqueezeProxyCm
+                | Arm::SqueezeProxyCmInputs
                 | Arm::SqueezeFull
                 | Arm::SqueezeScout
                 | Arm::SqueezeCompact
@@ -186,6 +191,7 @@ impl Arm {
         match self {
             Arm::SqueezeProxy => Some(&[]),
             Arm::SqueezeProxyCm => Some(&["--context-edits", "cold"]),
+            Arm::SqueezeProxyCmInputs => Some(&["--context-edits", "cold", "--clear-tool-inputs"]),
             _ => None,
         }
     }
@@ -273,13 +279,14 @@ impl std::str::FromStr for Arm {
             "squeeze-mcp" => Arm::SqueezeMcp,
             "squeeze-proxy" => Arm::SqueezeProxy,
             "squeeze-proxy-cm" => Arm::SqueezeProxyCm,
+            "squeeze-proxy-cm-inputs" => Arm::SqueezeProxyCmInputs,
             "squeeze-full" => Arm::SqueezeFull,
             "squeeze-scout" => Arm::SqueezeScout,
             "squeeze-compact" => Arm::SqueezeCompact,
             "squeeze-max" => Arm::SqueezeMax,
             other => {
                 bail!(
-                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-compact, squeeze-max, squeeze-hook, squeeze-mcp, squeeze-proxy, squeeze-proxy-cm)"
+                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-compact, squeeze-max, squeeze-hook, squeeze-mcp, squeeze-proxy, squeeze-proxy-cm, squeeze-proxy-cm-inputs)"
                 )
             }
         })
@@ -1274,7 +1281,7 @@ mod tests {
 
     #[test]
     fn arms_that_replace_file_tools_serve_squeeze_tools() {
-        let names = "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-max,squeeze-hook,squeeze-mcp,squeeze-proxy,squeeze-proxy-cm";
+        let names = "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-max,squeeze-hook,squeeze-mcp,squeeze-proxy,squeeze-proxy-cm,squeeze-proxy-cm-inputs";
         for name in names.split(',') {
             let arm: Arm = name.parse().unwrap();
             assert_eq!(arm.name(), name);
