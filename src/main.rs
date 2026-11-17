@@ -278,6 +278,10 @@ struct ReplayArgs {
     /// With --dump-requests: each as the summarizing request compaction would send for it
     #[arg(long, hide = true, requires = "dump_requests")]
     as_summary: bool,
+    /// With --dump-requests: each as the compaction proxy would forward it, with a placeholder
+    /// summary made after each of these requests (0-based, in the first transcript's order)
+    #[arg(long, hide = true, requires = "dump_requests", value_delimiter = ',')]
+    compact_after: Vec<usize>,
     /// Try a different log line limit (default 250)
     #[arg(long)]
     max_lines: Option<usize>,
@@ -840,9 +844,24 @@ fn cmd_replay(a: ReplayArgs) -> Result<()> {
         return cmd_cache_sim(&a, &files);
     }
     if a.dump_requests {
+        use squeeze::compact;
         for f in &files {
-            for r in cachesim::rebuild(f, Regime::OneHour)?.unwrap_or_default() {
-                let body = if a.as_summary { squeeze::compact::summary_request(&r.body) } else { Some(r.body) };
+            let mut state = compact::CompactState::default();
+            for (i, r) in cachesim::rebuild(f, Regime::OneHour)?.unwrap_or_default().into_iter().enumerate() {
+                let mut body = r.body;
+                let client = body["messages"].as_array().cloned().unwrap_or_default();
+                if !a.compact_after.is_empty() {
+                    compact::apply(&mut body, &mut state, true);
+                    compact::guard(&mut body, &state);
+                    if a.compact_after.contains(&i) {
+                        state.pending = Some(compact::Summary {
+                            covered: client.len(),
+                            prefix_hash: compact::messages_hash(&client),
+                            text: "Placeholder summary for request validation. ".repeat(20),
+                        });
+                    }
+                }
+                let body = if a.as_summary { compact::summary_request(&body) } else { Some(body) };
                 println!("{}", json!({ "at": r.at, "betas": r.betas, "body": body }));
             }
         }

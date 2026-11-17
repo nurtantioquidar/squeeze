@@ -788,10 +788,16 @@ async fn compact_later(
         inner.store.save_thread(&key, state);
         true
     });
-    tracing::info!(
-        "compaction for thread {key}: {}",
-        if stored { "summary ready for the next request" } else { "no summary kept" }
-    );
+    // Kept so a failure can be diagnosed without paying for it again.
+    let error = (!(200..300).contains(&status))
+        .then(|| String::from_utf8_lossy(&bytes).chars().take(2_000).collect::<String>());
+    match &error {
+        Some(e) => tracing::warn!("compaction for thread {key}: the summarizing request got HTTP {status}: {e}"),
+        None => tracing::info!(
+            "compaction for thread {key}: {}",
+            if stored { "summary ready for the next request" } else { "no summary kept" }
+        ),
+    }
     {
         let mut t = lock(&inner.totals);
         t.compaction_requests += 1;
@@ -806,7 +812,8 @@ async fn compact_later(
         "model": usage.as_ref().and_then(|u| u.model.clone()).or(model),
         "status": status,
         "compaction": { "thread": key, "covered": covered, "stored": stored,
-                        "summary_chars": summary.as_ref().map_or(0, String::len) },
+                        "summary_chars": summary.as_ref().map_or(0, String::len),
+                        "summary": summary, "error": error },
         "usage": usage,
     });
     if let Err(e) = inner.store.append_record(&rec) {

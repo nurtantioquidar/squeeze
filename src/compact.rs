@@ -57,10 +57,15 @@ pub const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
 pub const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 /// The newest tool results and tool inputs that go to the summarizer whole;
 /// older ones longer than [`SKELETON_MIN_CHARS`] go as excerpts.
-const SKELETON_KEEP_RECENT: usize = 6;
-const SKELETON_MIN_CHARS: usize = 1_500;
-const SKELETON_HEAD_CHARS: usize = 600;
-const SKELETON_TAIL_CHARS: usize = 300;
+const SKELETON_KEEP_RECENT: usize = 4;
+const SKELETON_MIN_CHARS: usize = 800;
+const SKELETON_HEAD_CHARS: usize = 300;
+const SKELETON_TAIL_CHARS: usize = 150;
+/// Fixed text the summarizer needn't read because it stays in the
+/// conversation: the first message's long `<system-reminder>` blocks (project
+/// instructions) and long `system`-role messages (the environment).
+const FIXED_MIN_CHARS: usize = 1_500;
+const FIXED_STUB: &str = "[left out of the summary's input: it stays in the conversation]";
 
 /// What the summarizing request asks for, appended to the conversation.
 pub const INSTRUCTION: &str = "Stop working on the task for a moment. Your context is about to be compacted: \
@@ -114,13 +119,14 @@ pub struct Summary {
 
 impl Summary {
     /// The request continues the conversation this summary was made over; and
-    /// with `fresh`, it's the request right after: the final reply, then user input only.
+    /// with `fresh`, it's the request right after: the final reply, then user
+    /// input only (and Claude Code's `system`-role notes).
     fn fits(&self, messages: &[Value], fresh: bool) -> bool {
         let n = self.covered;
         n >= 2
             && messages.len() > n + 1
             && role(&messages[n]) == Some("assistant")
-            && (!fresh || messages[n + 1..].iter().all(|m| role(m) == Some("user")))
+            && (!fresh || messages[n + 1..].iter().all(|m| matches!(role(m), Some("user" | "system"))))
             && messages_hash(&messages[..n]) == self.prefix_hash
     }
 }
@@ -285,10 +291,40 @@ fn skeleton(messages: &mut [Value]) {
     }
 }
 
+/// Stub the fixed text in the summarizer's input ([`FIXED_MIN_CHARS`]).
+fn stub_fixed(messages: &mut [Value]) {
+    let long = |t: &str, reminder_only: bool| {
+        t.chars().count() > FIXED_MIN_CHARS
+            && (!reminder_only || (t.starts_with("<system-reminder>") && t.trim_end().ends_with("</system-reminder>")))
+    };
+    for (i, m) in messages.iter_mut().enumerate() {
+        let reminder_only = match role(m) {
+            Some("system") => false,
+            _ if i == 0 => true,
+            _ => continue,
+        };
+        match m.get_mut("content") {
+            Some(Value::String(t)) if long(t, reminder_only) => *t = FIXED_STUB.into(),
+            Some(Value::Array(blocks)) => {
+                for blk in blocks.iter_mut().filter(|b| b.get("type").and_then(Value::as_str) == Some("text")) {
+                    if let Some(Value::String(t)) = blk.get_mut("text")
+                        && long(t, reminder_only)
+                    {
+                        *t = FIXED_STUB.into();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The summarizing request: the request that ended the turn, as forwarded,
-/// with older tool output cut to excerpts ([`skeleton`]), the instruction
-/// appended to its last message, no cache markers on the messages (the system
-/// prompt's stay), mismatched thinking dropped rather than refused, low
+/// with older tool output cut to excerpts ([`skeleton`]) and fixed text
+/// stubbed ([`stub_fixed`]), the instruction added to its last user message
+/// (before any `system`-role messages that end it, which the API allows only
+/// last or before an assistant message), no cache markers on the messages (the
+/// system prompt's stay), mismatched thinking dropped rather than refused, low
 /// effort, and no streaming. It needs [`THINKING_BINDING_BETA`].
 pub fn summary_request(forwarded: &Value) -> Option<Value> {
     let mut b = forwarded.clone();
@@ -301,16 +337,16 @@ pub fn summary_request(forwarded: &Value) -> Option<Value> {
         }
     }
     skeleton(messages);
+    stub_fixed(messages);
     let instruction = json!({ "type": "text", "text": INSTRUCTION });
-    let last = messages.last_mut()?;
-    if role(last) == Some("user") {
-        match last.get_mut("content") {
+    let at = messages.iter().rposition(|m| role(m) != Some("system")).map_or(0, |i| i + 1);
+    match at.checked_sub(1).map(|i| &mut messages[i]) {
+        Some(last) if role(last) == Some("user") => match last.get_mut("content") {
             Some(Value::Array(blocks)) => blocks.push(instruction),
             Some(Value::String(t)) => last["content"] = json!([{ "type": "text", "text": t.clone() }, instruction]),
             _ => return None,
-        }
-    } else {
-        messages.push(json!({ "role": "user", "content": [instruction] }));
+        },
+        _ => messages.insert(at, json!({ "role": "user", "content": [instruction] })),
     }
     b["stream"] = json!(false);
     b["max_tokens"] = json!(SUMMARY_MAX_TOKENS);
@@ -551,13 +587,70 @@ mod tests {
         let r = summary_request(&json!({ "thinking": { "type": "adaptive" }, "messages": messages })).unwrap();
         let m = r["messages"].as_array().unwrap();
         let len = |v: &Value| v.as_str().unwrap().chars().count();
-        // The two oldest of eight are cut, the newest six whole.
-        assert!(len(&m[2]["content"][0]["content"]) < 1000 && len(&m[1]["content"][0]["input"]["content"]) < 1000);
-        assert!(m[2]["content"][0]["content"].as_str().unwrap().contains("4100 characters left out"));
-        assert_eq!(len(&m[6]["content"][0]["content"]), 5000);
-        assert_eq!(len(&m[5]["content"][0]["input"]["content"]), 3000);
-        assert_eq!(m[5]["content"][0]["input"]["file_path"], "f2", "short fields whole");
+        // The four oldest of eight are cut, the newest four whole.
+        assert!(len(&m[8]["content"][0]["content"]) < 600 && len(&m[7]["content"][0]["input"]["content"]) < 600);
+        assert!(m[2]["content"][0]["content"].as_str().unwrap().contains("4550 characters left out"));
+        assert_eq!(len(&m[10]["content"][0]["content"]), 5000);
+        assert_eq!(len(&m[9]["content"][0]["input"]["content"]), 3000);
+        assert_eq!(m[7]["content"][0]["input"]["file_path"], "f3", "short fields whole");
         assert_eq!(r["thinking"]["block_binding"]["prefix_mismatch_behavior"], "drop_block");
+    }
+
+    #[test]
+    fn the_instruction_goes_before_system_messages_that_end_the_request() {
+        // Claude Code often ends a request with a `system`-role note; a user
+        // message after it is refused ("role 'system' must precede an
+        // 'assistant' message or end the array").
+        let mut messages = convo(false);
+        messages.push(system("# Environment update\n - Primary working directory: /grafana"));
+        let r = summary_request(&json!({ "messages": messages })).unwrap();
+        let m = r["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 10);
+        assert_eq!(m[9], system("# Environment update\n - Primary working directory: /grafana"), "still last");
+        assert_eq!(m[8]["content"][1]["text"], INSTRUCTION, "on the last user message");
+
+        // After an assistant message, a new user message goes before them.
+        let mut messages = convo(true);
+        messages.pop();
+        messages.push(system("note"));
+        let r = summary_request(&json!({ "messages": messages })).unwrap();
+        let m = r["messages"].as_array().unwrap();
+        assert_eq!((m.len(), m[10]["role"].clone(), m[11].clone()), (12, json!("user"), system("note")));
+    }
+
+    #[test]
+    fn the_summarizer_skips_fixed_text_that_stays_in_the_conversation() {
+        let reminder = format!("<system-reminder>\n{}\n</system-reminder>", "i".repeat(2000));
+        let first = json!({ "role": "user", "content": [
+            { "type": "text", "text": reminder },
+            { "type": "text", "text": format!("{} ticket", "t".repeat(2000)) },
+            { "type": "text", "text": format!("{SUMMARY_OPEN}{}{SUMMARY_CLOSE}", "s".repeat(2000)) }
+        ] });
+        let messages = vec![
+            first,
+            system(&format!("# Environment\n{}", "e".repeat(2000))),
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": "ok" }] }),
+            json!({ "role": "user", "content": format!("<system-reminder>{}</system-reminder>", "u".repeat(2000)) }),
+            system("short note"),
+        ];
+        let r = summary_request(&json!({ "messages": messages })).unwrap();
+        let m = r["messages"].as_array().unwrap();
+        assert_eq!(m[0]["content"][0]["text"], FIXED_STUB, "project instructions");
+        assert!(m[0]["content"][1]["text"].as_str().unwrap().ends_with("ticket"), "the request stays");
+        assert!(m[0]["content"][2]["text"].as_str().unwrap().contains("sss"), "the previous summary stays");
+        assert_eq!(m[1]["content"], FIXED_STUB, "the environment");
+        assert_eq!(m[3]["content"][0]["text"].as_str().unwrap().len(), 2000 + 35, "later reminders stay");
+        assert_eq!(m[4], system("short note"));
+    }
+
+    #[test]
+    fn a_pending_summary_fits_with_a_system_note_after_the_reply() {
+        let mut messages = convo(true);
+        messages.push(system("# Environment update"));
+        let mut body = json!({ "messages": messages });
+        let mut st = pending();
+        assert!(apply(&mut body, &mut st, true));
+        assert_eq!(body["messages"].as_array().unwrap().len(), 6);
     }
 
     #[test]
