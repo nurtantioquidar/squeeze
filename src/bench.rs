@@ -143,6 +143,9 @@ pub enum Arm {
     /// conversation once it nears [`COMPACT_WINDOW_TOKENS`] instead of near
     /// the model's full window (`squeeze run --compact-window`).
     SqueezeCompact,
+    /// The subscription-safe stack: squeeze-compact plus a short compaction
+    /// summary (PreCompact guidance) and the aggressive compression profile.
+    SqueezeMax,
 }
 
 /// The context window Claude Code is told to compact within in the
@@ -162,6 +165,7 @@ impl Arm {
             Arm::SqueezeFull => "squeeze-full",
             Arm::SqueezeScout => "squeeze-scout",
             Arm::SqueezeCompact => "squeeze-compact",
+            Arm::SqueezeMax => "squeeze-max",
         }
     }
     pub(crate) fn uses_mcp(self) -> bool {
@@ -174,6 +178,7 @@ impl Arm {
                 | Arm::SqueezeFull
                 | Arm::SqueezeScout
                 | Arm::SqueezeCompact
+                | Arm::SqueezeMax
         )
     }
     /// The `squeeze proxy` flags of an arm that runs through the proxy.
@@ -189,11 +194,26 @@ impl Arm {
         self.proxy_args().is_some()
     }
     pub(crate) fn uses_hook(self) -> bool {
-        matches!(self, Arm::Squeeze | Arm::SqueezeHook | Arm::SqueezeFull | Arm::SqueezeScout | Arm::SqueezeCompact)
+        matches!(
+            self,
+            Arm::Squeeze
+                | Arm::SqueezeHook
+                | Arm::SqueezeFull
+                | Arm::SqueezeScout
+                | Arm::SqueezeCompact
+                | Arm::SqueezeMax
+        )
     }
     /// squeeze's tools replace Claude Code's built-in file tools.
     pub(crate) fn replaces_file_tools(self) -> bool {
-        matches!(self, Arm::SqueezeFull | Arm::SqueezeScout | Arm::SqueezeCompact)
+        matches!(self, Arm::SqueezeFull | Arm::SqueezeScout | Arm::SqueezeCompact | Arm::SqueezeMax)
+    }
+    /// Hook and compaction settings beyond squeeze's defaults.
+    pub(crate) fn tune_settings(self, settings: &mut Value, exe: &Path) {
+        if self == Arm::SqueezeMax {
+            crate::hook::set_aggressive(settings);
+            crate::hook::add_compact_hook(settings, exe);
+        }
     }
     /// Environment for the coding agent's Claude Code. Every arm runs without
     /// background tasks: with them, `claude -p` can return while a background
@@ -201,7 +221,7 @@ impl Arm {
     /// simulated user reviews a reply written mid-task.
     pub(crate) fn env(self) -> Vec<(&'static str, String)> {
         let mut env = vec![("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1".to_string())];
-        if self == Arm::SqueezeCompact {
+        if matches!(self, Arm::SqueezeCompact | Arm::SqueezeMax) {
             env.push(("CLAUDE_CODE_AUTO_COMPACT_WINDOW", COMPACT_WINDOW_TOKENS.to_string()));
         }
         env
@@ -256,9 +276,10 @@ impl std::str::FromStr for Arm {
             "squeeze-full" => Arm::SqueezeFull,
             "squeeze-scout" => Arm::SqueezeScout,
             "squeeze-compact" => Arm::SqueezeCompact,
+            "squeeze-max" => Arm::SqueezeMax,
             other => {
                 bail!(
-                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-compact, squeeze-hook, squeeze-mcp, squeeze-proxy, squeeze-proxy-cm)"
+                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-compact, squeeze-max, squeeze-hook, squeeze-mcp, squeeze-proxy, squeeze-proxy-cm)"
                 )
             }
         })
@@ -710,7 +731,9 @@ async fn session_inner(r: &Run<'_>, model: Option<&str>, res: &mut SessionResult
         r#"{"mcpServers":{}}"#.to_string()
     };
     let settings = if r.arm.uses_hook() {
-        Some(crate::hook::session_settings(&ctx.exe, r.arm.uses_mcp()))
+        let mut s = crate::hook::session_settings(&ctx.exe, r.arm.uses_mcp());
+        r.arm.tune_settings(&mut s, &ctx.exe);
+        Some(s)
     } else if r.arm.uses_mcp() {
         Some(json!({ "permissions": { "allow": r.arm.tool_names() } }))
     } else {
@@ -1247,6 +1270,32 @@ mod tests {
         assert_eq!(s.squeeze_tool_calls(), 2, "the scout's squeeze calls count");
         assert!((s.agent.cost_usd - 4.25).abs() < 1e-9, "cost from the last snapshot");
         assert_eq!(s.agent_all_models.cache_read_input_tokens, 7);
+    }
+
+    #[test]
+    fn arms_that_replace_file_tools_serve_squeeze_tools() {
+        let names = "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-max,squeeze-hook,squeeze-mcp,squeeze-proxy,squeeze-proxy-cm";
+        for name in names.split(',') {
+            let arm: Arm = name.parse().unwrap();
+            assert_eq!(arm.name(), name);
+            // Without the MCP server, turning off the file tools leaves the agent only Bash.
+            assert!(!arm.replaces_file_tools() || arm.uses_mcp(), "{name}");
+        }
+
+        let exe = Path::new("/bin/squeeze");
+        let mut s = crate::hook::session_settings(exe, Arm::SqueezeMax.uses_mcp());
+        Arm::SqueezeMax.tune_settings(&mut s, exe);
+        assert_eq!(
+            s["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "/bin/squeeze hook post-tool-use --hint mcp --profile aggressive"
+        );
+        assert_eq!(s["hooks"]["PreCompact"][0]["hooks"][0]["command"], "/bin/squeeze hook pre-compact");
+        assert!(Arm::SqueezeMax.tool_names().contains(&"mcp__squeeze__edit_many".to_string()));
+        assert!(Arm::SqueezeMax.env().iter().any(|(k, _)| *k == "CLAUDE_CODE_AUTO_COMPACT_WINDOW"));
+
+        let mut s = crate::hook::session_settings(exe, Arm::SqueezeCompact.uses_mcp());
+        Arm::SqueezeCompact.tune_settings(&mut s, exe);
+        assert!(s["hooks"]["PreCompact"].is_null(), "only squeeze-max changes the hooks");
     }
 
     #[test]

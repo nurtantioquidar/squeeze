@@ -121,6 +121,15 @@ pub struct LogPolicy {
     pub repeat_min: usize,
 }
 
+impl LogPolicy {
+    /// `--profile aggressive`: logs keep about their first 15 and last 25 lines
+    /// plus up to 20 important ones (errors, failures), so long outputs shrink
+    /// to roughly a third. The original stays recoverable with expand.
+    pub fn aggressive() -> Self {
+        Self { max_lines: 60, head: 15, tail: 25, important_budget: 20, ..Self::default() }
+    }
+}
+
 impl Default for LogPolicy {
     fn default() -> Self {
         Self {

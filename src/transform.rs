@@ -69,6 +69,21 @@ pub struct TransformConfig {
     pub ctx_window: Option<KeepWindow>,
 }
 
+impl TransformConfig {
+    /// `--profile aggressive`: compress logs, diffs, searches and test output
+    /// from 1 KB, down to about a third. File views stay verbatim (the agent
+    /// edits from them).
+    pub fn aggressive(expand_hint: ExpandHint) -> Self {
+        Self {
+            min_bytes: 1024,
+            min_saving_bytes: 200,
+            log: compress::LogPolicy::aggressive(),
+            expand_hint,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for TransformConfig {
     fn default() -> Self {
         Self {
@@ -666,6 +681,32 @@ pub fn last_tool_result_id(body: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggressive_profile_cuts_logs_but_never_file_views() {
+        #[derive(Default)]
+        struct Sink(Vec<String>);
+        impl BlobSink for Sink {
+            fn put(&mut self, text: &str) -> String {
+                self.0.push(text.to_string());
+                format!("{:024x}", self.0.len())
+            }
+        }
+        // 100 distinct lines (about 4 KB): under the default 250-line limit, over the aggressive 60.
+        // Each starts with a number, so no run of lines shares a first word (runs collapse in both profiles).
+        let log: String = (0..100).map(|i| format!("{i:03} compiled module_{i} in {}ms\n", i * 7)).collect();
+        let bash = |cmd: &str| json!({ "command": cmd });
+        let default = TransformConfig::default();
+        let aggressive = TransformConfig::aggressive(ExpandHint::Mcp);
+        let mut sink = Sink::default();
+        assert!(compress_tool_text("Bash", &bash("make build"), &log, &default, &mut sink).is_none());
+        let cut = compress_tool_text("Bash", &bash("make build"), &log, &aggressive, &mut sink).unwrap();
+        assert!(cut.lines().count() <= 65 && cut.len() < log.len() / 2, "{} lines", cut.lines().count());
+        assert!(cut.contains("expand"), "the original stays recoverable");
+        assert_eq!(sink.0, vec![log.clone()]);
+        // File views stay verbatim even in the aggressive profile.
+        assert!(compress_tool_text("Bash", &bash("cat src/big.rs"), &log, &aggressive, &mut sink).is_none());
+    }
 
     #[derive(Default)]
     struct MemSink(HashMap<String, String>);
