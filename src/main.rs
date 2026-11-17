@@ -118,6 +118,12 @@ struct CompressFlags {
     /// input price for it
     #[arg(long, requires = "compact_pauses")]
     compact_warm: bool,
+    /// With --compact-warm: while a tool call runs past the prompt cache's TTL (a long
+    /// test run, a subagent), send the request it answered again for one output token a
+    /// minute before the cache would expire (at most 6 times), so Claude Code's next
+    /// request reads the conversation from the cache instead of writing it again
+    #[arg(long, requires = "compact_warm")]
+    keep_warm: bool,
     /// With --context-edits: also clear thinking from before the latest human prompt.
     /// Off by default: Claude Code sends old thinking without its text (about 30-50
     /// tokens a turn), and the API counts a thinking turn at every reminder Claude Code
@@ -180,6 +186,7 @@ impl CompressFlags {
         Ok(Some(squeeze::compact::CompactConfig {
             idle_secs: self.compact_idle_secs,
             warm: self.compact_warm,
+            keep_warm: self.keep_warm,
             ..Default::default()
         }))
     }

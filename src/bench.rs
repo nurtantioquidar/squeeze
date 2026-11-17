@@ -142,6 +142,9 @@ pub enum Arm {
     /// squeeze-proxy-compact with summaries read from Claude Code's cache
     /// (`--compact-warm`: its requests go out without the claude-code beta).
     SqueezeProxyCompactWarm,
+    /// squeeze-proxy-compact-warm that also keeps the conversation cached
+    /// while a tool call runs past the TTL (`--keep-warm`).
+    SqueezeProxyCompactKeepWarm,
     /// Hook compression + MCP tools that replace Claude Code's file tools
     /// (Read/Edit/Write/Grep/Glob turned off), working guidance, and unused
     /// built-in tools trimmed (`squeeze run --replace-file-tools --trim-tools`).
@@ -175,6 +178,7 @@ impl Arm {
             Arm::SqueezeProxyCmInputs => "squeeze-proxy-cm-inputs",
             Arm::SqueezeProxyCompact => "squeeze-proxy-compact",
             Arm::SqueezeProxyCompactWarm => "squeeze-proxy-compact-warm",
+            Arm::SqueezeProxyCompactKeepWarm => "squeeze-proxy-compact-keepwarm",
             Arm::SqueezeFull => "squeeze-full",
             Arm::SqueezeScout => "squeeze-scout",
             Arm::SqueezeCompact => "squeeze-compact",
@@ -191,6 +195,7 @@ impl Arm {
                 | Arm::SqueezeProxyCmInputs
                 | Arm::SqueezeProxyCompact
                 | Arm::SqueezeProxyCompactWarm
+                | Arm::SqueezeProxyCompactKeepWarm
                 | Arm::SqueezeFull
                 | Arm::SqueezeScout
                 | Arm::SqueezeCompact
@@ -205,6 +210,7 @@ impl Arm {
             Arm::SqueezeProxyCmInputs => Some(&["--context-edits", "cold", "--clear-tool-inputs"]),
             Arm::SqueezeProxyCompact => Some(&["--compact-pauses"]),
             Arm::SqueezeProxyCompactWarm => Some(&["--compact-pauses", "--compact-warm"]),
+            Arm::SqueezeProxyCompactKeepWarm => Some(&["--compact-pauses", "--compact-warm", "--keep-warm"]),
             _ => None,
         }
     }
@@ -295,13 +301,14 @@ impl std::str::FromStr for Arm {
             "squeeze-proxy-cm-inputs" => Arm::SqueezeProxyCmInputs,
             "squeeze-proxy-compact" => Arm::SqueezeProxyCompact,
             "squeeze-proxy-compact-warm" => Arm::SqueezeProxyCompactWarm,
+            "squeeze-proxy-compact-keepwarm" => Arm::SqueezeProxyCompactKeepWarm,
             "squeeze-full" => Arm::SqueezeFull,
             "squeeze-scout" => Arm::SqueezeScout,
             "squeeze-compact" => Arm::SqueezeCompact,
             "squeeze-max" => Arm::SqueezeMax,
             other => {
                 bail!(
-                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-compact, squeeze-max, squeeze-hook, squeeze-mcp, squeeze-proxy, squeeze-proxy-cm, squeeze-proxy-cm-inputs, squeeze-proxy-compact, squeeze-proxy-compact-warm)"
+                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-compact, squeeze-max, squeeze-hook, squeeze-mcp, squeeze-proxy, squeeze-proxy-cm, squeeze-proxy-cm-inputs, squeeze-proxy-compact, squeeze-proxy-compact-warm, squeeze-proxy-compact-keepwarm)"
                 )
             }
         })
@@ -482,12 +489,14 @@ impl SessionResult {
 }
 
 /// What the proxy's own requests for `session` cost (the summaries of
-/// `--compact-pauses`), from the store's per-request records.
+/// `--compact-pauses`, the keep-warm requests of `--keep-warm`), from the
+/// store's per-request records.
 pub fn proxy_cost(store_root: &Path, session: &str) -> f64 {
     let Ok(store) = crate::store::Store::open(store_root) else { return 0.0 };
     let mut total = 0.0;
     for rec in store.records().unwrap_or_default() {
-        if rec.get("compaction").is_none() || rec.get("session").and_then(Value::as_str) != Some(session) {
+        let own = rec.get("compaction").is_some() || rec.get("keep_warm").is_some();
+        if !own || rec.get("session").and_then(Value::as_str) != Some(session) {
             continue;
         }
         let Some(u) = rec.get("usage").and_then(|u| serde_json::from_value::<crate::sse::Usage>(u.clone()).ok()) else {
@@ -496,7 +505,7 @@ pub fn proxy_cost(store_root: &Path, session: &str) -> f64 {
         let model = rec.get("model").and_then(Value::as_str).unwrap_or("");
         match crate::util::usage_usd(model, &u) {
             Some(usd) => total += usd,
-            None => tracing::warn!("no price for {model:?}: a compaction's cost is left out"),
+            None => tracing::warn!("no price for {model:?}: a proxy request's cost is left out"),
         }
     }
     total
@@ -1330,7 +1339,7 @@ mod tests {
 
     #[test]
     fn arms_that_replace_file_tools_serve_squeeze_tools() {
-        let names = "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-max,squeeze-hook,squeeze-mcp,squeeze-proxy,squeeze-proxy-cm,squeeze-proxy-cm-inputs,squeeze-proxy-compact,squeeze-proxy-compact-warm";
+        let names = "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-max,squeeze-hook,squeeze-mcp,squeeze-proxy,squeeze-proxy-cm,squeeze-proxy-cm-inputs,squeeze-proxy-compact,squeeze-proxy-compact-warm,squeeze-proxy-compact-keepwarm";
         for name in names.split(',') {
             let arm: Arm = name.parse().unwrap();
             assert_eq!(arm.name(), name);
@@ -1360,17 +1369,19 @@ mod tests {
         let store = crate::store::Store::open(dir.path()).unwrap();
         let usage = json!({ "input_tokens": 1_000_000, "output_tokens": 0, "cache_creation_input_tokens": 0,
                             "cache_read_input_tokens": 0, "cache_creation_1h": 0, "cache_creation_5m": 0 });
-        for (session, compaction) in [("s1", true), ("s1", false), ("s2", true)] {
+        for (session, own) in
+            [("s1", Some("compaction")), ("s1", None), ("s1", Some("keep_warm")), ("s2", Some("compaction"))]
+        {
             let mut rec = json!({ "session": session, "model": "claude-opus-5-5", "usage": usage });
-            if compaction {
-                rec["compaction"] = json!({ "stored": true });
+            if let Some(kind) = own {
+                rec[kind] = json!({ "thread": "t" });
             }
             store.append_record(&rec).unwrap();
         }
-        assert!((proxy_cost(dir.path(), "s1") - 4.0).abs() < 1e-9, "only s1's summaries, at $4 per Mtok");
+        assert!((proxy_cost(dir.path(), "s1") - 8.0).abs() < 1e-9, "only s1's own requests, at $4 per Mtok");
         let mut r = session(Arm::SqueezeProxyCompact, 0, 2.0, 0.9);
         r.proxy_usd = proxy_cost(dir.path(), "s1");
-        assert!((r.cost_usd() - 6.0).abs() < 1e-9);
+        assert!((r.cost_usd() - 10.0).abs() < 1e-9);
     }
 
     #[test]

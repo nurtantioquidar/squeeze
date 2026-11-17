@@ -109,6 +109,8 @@ pub struct Totals {
     /// the summaries they produced.
     pub compaction_requests: u64,
     pub compactions: u64,
+    /// Keep-warm requests the proxy made itself (`--keep-warm`).
+    pub keep_warm_requests: u64,
     pub bytes_saved: u64,
     /// Estimated input-side savings, in base-input-token equivalents.
     pub saved_input_eq: f64,
@@ -721,17 +723,116 @@ impl Pending {
         if let Err(e) = self.inner.store.append_record(&rec) {
             tracing::warn!("could not write stats: {e}");
         }
-        // A turn that ended: summarize its conversation if the thread then pauses.
-        if let (Some(cfg), Some(job), Some(key), Some((started, _)), Some(u)) =
-            (self.inner.compact, self.compact, self.thread, self.stamp, usage.as_ref())
+        // A turn that ended: summarize its conversation if the thread then
+        // pauses. A tool call to run: with --keep-warm, keep the conversation
+        // cached should it run past the TTL.
+        let stop = usage.as_ref().and_then(|u| u.stop_reason.as_deref());
+        if let (Some(cfg), Some(job), Some(key), Some((started, _))) =
+            (self.inner.compact, self.compact, self.thread, self.stamp)
             && ok
-            && u.stop_reason.as_deref() == Some("end_turn")
             && job.credentials.is_some()
             && job.forwarded.is_some()
         {
             let inner = self.inner.clone();
-            tokio::spawn(compact_later(inner, cfg, key, self.session, model, started, job));
+            match stop {
+                Some("end_turn") => {
+                    tokio::spawn(compact_later(inner, cfg, key, self.session, model, started, job));
+                }
+                Some("tool_use") if cfg.keep_warm => {
+                    tokio::spawn(keep_warm(inner, cfg, key, self.session, model, started, job));
+                }
+                _ => {}
+            }
         }
+    }
+}
+
+/// While the tool call a response asked for runs, send the request it answered
+/// again, for one output token ([`compact::keep_warm_request`]), shortly
+/// before that request's cache would expire: a cache read that keeps the
+/// conversation cached for Claude Code's next request, which would otherwise
+/// write it all again. Stops at the thread's next request, after a failed
+/// request, or after [`compact::KEEP_WARM_MAX_PINGS`], dropping the credentials.
+async fn keep_warm(
+    inner: Arc<Inner>,
+    cfg: CompactConfig,
+    key: String,
+    session: Option<String>,
+    model: Option<String>,
+    started: u64,
+    job: CompactJob,
+) {
+    let CompactJob { generation, forwarded, credentials, bound, .. } = job;
+    let (Some(forwarded), Some(credentials)) = (forwarded, credentials) else { return };
+    let Ok(body) = serde_json::from_slice::<Value>(&forwarded) else { return };
+    let Some(payload) = compact::keep_warm_request(&body).and_then(|r| serde_json::to_vec(&r).ok()) else { return };
+    let every = cfg
+        .idle_secs
+        .unwrap_or_else(|| transform::message_cache_ttl_secs(&body).saturating_sub(compact::IDLE_LEAD_SECS))
+        .max(1);
+    // Exactly the forwarded request's betas, as for a warm summary.
+    let extra: &[&str] = if bound { &[compact::THINKING_BINDING_BETA] } else { &[] };
+    let current = |inner: &Inner| lock(&inner.generations).get(&key).copied() == Some(generation);
+    let mut last = started;
+    for ping in 1..=compact::KEEP_WARM_MAX_PINGS {
+        let wait = (last + every).saturating_sub(inner.clock.now_secs());
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+        if !current(&inner) {
+            return;
+        }
+        let at = inner.clock.now_secs();
+        let sent = credentials
+            .apply(inner.client.post(format!("{}/v1/messages", inner.upstream)), extra)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::USER_AGENT, concat!("squeeze/", env!("CARGO_PKG_VERSION")))
+            .timeout(Duration::from_secs(120))
+            .body(payload.clone())
+            .send()
+            .await;
+        let (status, bytes) = match sent {
+            Ok(r) => (r.status().as_u16(), r.bytes().await.unwrap_or_default()),
+            Err(e) => {
+                tracing::warn!("keep-warm for thread {key}: the request failed: {e}");
+                return;
+            }
+        };
+        let mut tap = UsageTap::new(false);
+        tap.feed(&bytes);
+        let usage = tap.finish();
+        let ok = (200..300).contains(&status);
+        let error = (!ok).then(|| String::from_utf8_lossy(&bytes).chars().take(2_000).collect::<String>());
+        {
+            let mut t = lock(&inner.totals);
+            t.keep_warm_requests += 1;
+            if let Some(u) = &usage {
+                t.usage.add(u);
+            }
+        }
+        // The cache's TTL now runs from this request (unless the thread's
+        // next request started meanwhile, later still).
+        if ok && let Some(state) = lock(&inner.threads).get_mut(&key) {
+            state.last_start = state.last_start.max(Some(at));
+            inner.store.save_thread(&key, state);
+        }
+        let rec = json!({
+            "ts": now_secs(),
+            "session": session,
+            "model": usage.as_ref().and_then(|u| u.model.clone()).or_else(|| model.clone()),
+            "status": status,
+            "keep_warm": { "thread": key, "ping": ping, "error": error },
+            "usage": usage,
+        });
+        if let Err(e) = inner.store.append_record(&rec) {
+            tracing::warn!("could not write stats: {e}");
+        }
+        match &error {
+            Some(e) => {
+                tracing::warn!("keep-warm for thread {key}: HTTP {status}: {e}");
+                return;
+            }
+            None => tracing::info!("keep-warm for thread {key}: conversation still cached (request {ping})"),
+        }
+        last = at;
     }
 }
 

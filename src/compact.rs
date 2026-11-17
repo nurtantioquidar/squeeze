@@ -25,6 +25,13 @@
 //! forwarded request itself with the instruction added at its end: same
 //! system prompt, tools, messages, cache markers, thinking settings and betas,
 //! so it reads the whole conversation from the cache ([`warm_summary_request`]).
+//!
+//! With `--keep-warm` as well, a tool call that keeps Claude Code waiting past
+//! the cache's TTL (a long test run, a subagent) doesn't cost rewriting the
+//! conversation: shortly before the cache would expire, the proxy sends the
+//! request the tool call answered again, for one output token
+//! ([`keep_warm_request`]), which reads the conversation from the cache and so
+//! keeps it there for Claude Code's next request.
 
 use crate::auth;
 use crate::util::short_hash;
@@ -44,17 +51,26 @@ pub struct CompactConfig {
     /// `--compact-warm`: forward Claude Code's requests without its beta and
     /// summarize from the cache ([`warm_summary_request`]).
     pub warm: bool,
+    /// `--keep-warm` (with `warm`): keep the conversation cached while a tool
+    /// call runs past the cache's TTL ([`keep_warm_request`]).
+    pub keep_warm: bool,
 }
 
 impl Default for CompactConfig {
     fn default() -> Self {
-        Self { idle_secs: None, min_tokens: 20_000, warm: false }
+        Self { idle_secs: None, min_tokens: 20_000, warm: false, keep_warm: false }
     }
 }
 
 /// The summarizing request goes out this long before the cache would expire,
-/// so it still reads the system prompt and tools from it.
+/// so it still reads the system prompt and tools from it; so does a keep-warm
+/// request.
 pub const IDLE_LEAD_SECS: u64 = 60;
+/// Keep-warm requests for one tool call at most (about 24 minutes at the
+/// 5-minute TTL). Each costs a cache read of the conversation, a 25th of
+/// rewriting it, so a tool call that never returns costs at most about a
+/// quarter of the rewrite the requests are there to avoid.
+pub const KEEP_WARM_MAX_PINGS: u32 = 6;
 /// Room for the summary and the thinking before it.
 const SUMMARY_MAX_TOKENS: u64 = 16_000;
 /// A summary shorter than this is taken for a failed one.
@@ -395,6 +411,18 @@ pub fn warm_summary_request(forwarded: &Value) -> Option<Value> {
     Some(b)
 }
 
+/// The keep-warm request for `--keep-warm`: the request whose response asked
+/// for the running tool call, exactly as forwarded, for one output token and
+/// without streaming. Nothing that keys the prompt cache changes, so it reads
+/// the whole conversation from the cache, which refreshes its TTL.
+pub fn keep_warm_request(forwarded: &Value) -> Option<Value> {
+    let mut b = forwarded.clone();
+    b.get("messages")?.as_array()?;
+    b["stream"] = json!(false);
+    b["max_tokens"] = json!(1);
+    Some(b)
+}
+
 /// An `anthropic-beta` value without Claude Code's beta, normalized the way
 /// [`Credentials`] keeps it (trimmed, comma-joined); `None` if nothing is left.
 pub fn without_claude_code_beta(value: &str) -> Option<String> {
@@ -690,6 +718,24 @@ mod tests {
         let mut st = pending();
         assert!(apply(&mut body, &mut st, true));
         assert_eq!(body["messages"].as_array().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn the_keep_warm_request_is_the_forwarded_one_for_one_token() {
+        let mut messages = convo(false);
+        messages[8]["content"][0]["cache_control"] = json!({ "type": "ephemeral" });
+        let forwarded = json!({
+            "model": "claude-opus-5-5", "stream": true, "max_tokens": 32000,
+            "thinking": { "type": "adaptive", "display": "omitted" }, "output_config": { "effort": "medium" },
+            "context_management": { "edits": [{ "type": "clear_thinking_20251015", "keep": "all" }] },
+            "system": [{ "type": "text", "text": "sys", "cache_control": { "type": "ephemeral" } }],
+            "messages": messages
+        });
+        let mut expect = forwarded.clone();
+        expect["stream"] = json!(false);
+        expect["max_tokens"] = json!(1);
+        assert_eq!(keep_warm_request(&forwarded).unwrap(), expect, "everything that keys the cache as forwarded");
+        assert!(keep_warm_request(&json!({ "model": "m" })).is_none(), "not a messages request");
     }
 
     #[test]
