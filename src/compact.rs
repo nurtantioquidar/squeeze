@@ -6,8 +6,9 @@
 //! request that ended the turn, held in memory only until then. From the next
 //! request on, the messages between the first one and the turn's final reply
 //! go out as that summary: the first message (Claude Code's instructions and
-//! context) and everything from the final reply on go verbatim, except that
-//! the final reply loses its thinking, which belongs to the summarized
+//! context), any `system`-role messages (Claude Code's environment and tool
+//! announcements) and everything from the final reply on go verbatim, except
+//! that the final reply loses its thinking, which belongs to the summarized
 //! context. A later pause summarizes again, the summary included.
 //!
 //! The summarizing request is squeeze's own, so it leaves out Claude Code's
@@ -168,8 +169,9 @@ pub fn apply(body: &mut Value, state: &mut CompactState, update: bool) -> bool {
     }
 }
 
-/// `messages[1..covered]` out, the summary appended to the first message, and
-/// the thinking taken out of the final reply at `covered`.
+/// `messages[1..covered]` out but for their `system`-role messages, the
+/// summary appended to the first message, and the thinking taken out of the
+/// final reply at `covered`.
 fn substitute(body: &mut Value, covered: usize, summary: &str) {
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else { return };
     let mut first = messages[0].clone();
@@ -187,8 +189,9 @@ fn substitute(body: &mut Value, covered: usize, summary: &str) {
             blocks.push(json!({ "type": "text", "text": "(continued)" }));
         }
     }
+    let system: Vec<Value> = messages[1..covered].iter().filter(|m| role(m) == Some("system")).cloned().collect();
     let rest = messages.split_off(covered + 1);
-    *messages = [first, reply].into_iter().chain(rest).collect();
+    *messages = std::iter::once(first).chain(system).chain([reply]).chain(rest).collect();
 }
 
 /// The summarizing request: the request that ended the turn, as forwarded,
@@ -305,10 +308,18 @@ mod tests {
         ]
     }
 
-    /// A first message, three tool loops, then (with `after`) the final reply and the next prompt.
+    fn system(text: &str) -> Value {
+        json!({ "role": "system", "content": text })
+    }
+
+    /// A first message and Claude Code's environment message, three tool loops
+    /// with a tool announcement among them, then (with `after`) the final reply
+    /// and the next prompt.
     fn convo(after: bool) -> Vec<Value> {
-        let mut m = vec![user("<system-reminder>instructions</system-reminder> do the ticket")];
+        let mut m =
+            vec![user("<system-reminder>instructions</system-reminder> do the ticket"), system("# Environment")];
         m.extend((0..3).flat_map(turn));
+        m.insert(5, system("New deferred tools: Monitor"));
         if after {
             m.push(json!({ "role": "assistant", "content": [
                 { "type": "thinking", "thinking": "", "signature": "final" }, { "type": "text", "text": "Done." }
@@ -331,9 +342,9 @@ mod tests {
     fn the_hash_ignores_cache_markers() {
         let mut a = convo(false);
         let b = a.clone();
-        a[6]["content"][0]["cache_control"] = json!({ "type": "ephemeral" });
+        a[8]["content"][0]["cache_control"] = json!({ "type": "ephemeral" });
         assert_eq!(messages_hash(&a), messages_hash(&b));
-        a[6]["content"][0]["content"] = json!("y");
+        a[8]["content"][0]["content"] = json!("y");
         assert_ne!(messages_hash(&a), messages_hash(&b));
     }
 
@@ -344,16 +355,17 @@ mod tests {
         assert!(apply(&mut body, &mut st, true));
         assert_eq!((st.active.clone(), st.pending.clone()), (Some(summary()), None), "in use");
         let m = body["messages"].as_array().unwrap();
-        assert_eq!(m.len(), 3);
+        assert_eq!(m.len(), 5);
         assert_eq!(m[0]["content"][0]["text"], "<system-reminder>instructions</system-reminder> do the ticket");
         let text = m[0]["content"][1]["text"].as_str().unwrap();
         assert!(text.starts_with(SUMMARY_OPEN) && text.contains(&"S".repeat(300)));
+        assert_eq!((m[1].clone(), m[2].clone()), (system("# Environment"), system("New deferred tools: Monitor")));
         assert_eq!(
-            m[1],
+            m[3],
             json!({ "role": "assistant", "content": [{ "type": "text", "text": "Done." }] }),
             "thinking out"
         );
-        assert_eq!(m[2], user("next ticket"));
+        assert_eq!(m[4], user("next ticket"));
 
         // Later requests in the conversation keep it, their own thinking included.
         let mut later = convo(true);
@@ -361,8 +373,8 @@ mod tests {
         let mut body = json!({ "messages": later.clone() });
         assert!(apply(&mut body, &mut st, true));
         let m = body["messages"].as_array().unwrap();
-        assert_eq!(m.len(), 5);
-        assert_eq!(m[3], later[later.len() - 2], "new turns verbatim");
+        assert_eq!(m.len(), 7);
+        assert_eq!(m[5], later[later.len() - 2], "new turns verbatim");
     }
 
     #[test]
@@ -385,12 +397,12 @@ mod tests {
         let mut body = json!({ "messages": later.clone() });
         assert!(apply(&mut body, &mut st, true));
         assert_eq!((st.active.is_some(), st.pending.is_none()), (true, true));
-        assert_eq!(body["messages"].as_array().unwrap().len(), 5);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 7);
 
         // A history that no longer continues the summarized one drops even an active summary.
         let mut st = CompactState { active: Some(summary()), ..Default::default() };
         let mut other = convo(true);
-        other[2]["content"][0]["content"] = json!("rewritten");
+        other[3]["content"][0]["content"] = json!("rewritten");
         let mut body = json!({ "messages": other });
         assert!(!apply(&mut body, &mut st, true));
         assert_eq!(st.active, None);
@@ -405,7 +417,7 @@ mod tests {
     #[test]
     fn the_summarizing_request_reuses_the_turn_without_markers_or_streaming() {
         let mut messages = convo(false);
-        messages[6]["content"][0]["cache_control"] = json!({ "type": "ephemeral" });
+        messages[8]["content"][0]["cache_control"] = json!({ "type": "ephemeral" });
         let forwarded = json!({
             "model": "claude-opus-5-5", "stream": true, "max_tokens": 32000,
             "system": [{ "type": "text", "text": "sys", "cache_control": { "type": "ephemeral" } }],
@@ -418,7 +430,7 @@ mod tests {
         assert!(!r["messages"].to_string().contains("cache_control"));
         let last = r["messages"].as_array().unwrap().last().unwrap();
         assert_eq!(last["content"][1]["text"], INSTRUCTION, "appended to the last user message");
-        assert_eq!(r["messages"].as_array().unwrap().len(), 7);
+        assert_eq!(r["messages"].as_array().unwrap().len(), 9);
     }
 
     #[test]
