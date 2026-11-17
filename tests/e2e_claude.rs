@@ -373,7 +373,7 @@ rubric = "anything"
             .arg(&results)
             .args([
                 "--arms",
-                "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-hook,squeeze-mcp,squeeze-proxy",
+                "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-max,squeeze-hook,squeeze-mcp,squeeze-proxy",
             ])
             .args(extra)
             .env("ANTHROPIC_API_KEY", FAKE_KEY)
@@ -393,7 +393,7 @@ rubric = "anything"
 
     let rows: Vec<Value> =
         std::fs::read_to_string(&results).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(rows.len(), 8, "one session per arm");
+    assert_eq!(rows.len(), 9, "one session per arm");
     let mut pushbacks = 0;
     for r in &rows {
         assert!(r["error"].is_null(), "{r}");

@@ -72,7 +72,7 @@ fn for_text_items(items: &mut [Value], f: &mut impl FnMut(&mut String)) {
 
 /// Entry point for `squeeze hook post-tool-use`. Never fails loudly: on any
 /// problem it prints nothing and Claude Code keeps the original output.
-pub fn run(stdin: &str, hint: ExpandHint) -> Option<String> {
+pub fn run(stdin: &str, hint: ExpandHint, aggressive: bool) -> Option<String> {
     let input: Value = serde_json::from_str(stdin).ok()?;
     if let Some(log) = std::env::var_os("SQUEEZE_HOOK_LOG") {
         // Debugging aid only: records raw hook payloads (which contain tool output).
@@ -82,7 +82,11 @@ pub fn run(stdin: &str, hint: ExpandHint) -> Option<String> {
         }
     }
     let store = Store::open(Store::default_root()).ok()?;
-    let cfg = TransformConfig { expand_hint: hint, ..Default::default() };
+    let cfg = if aggressive {
+        TransformConfig::aggressive(hint)
+    } else {
+        TransformConfig { expand_hint: hint, ..Default::default() }
+    };
     let mut sink = store.clone();
     let (reply, before, after) = post_tool_use(&input, &cfg, &mut sink)?;
     let _ = store.append_record(&json!({
@@ -121,14 +125,57 @@ const EDIT_TOOL: &str = "mcp__squeeze__edit_many";
 /// Edit does (see [`pre_tool_use`]) to session settings.
 pub fn add_edit_permission_hook(settings: &mut Value, exe: &Path) {
     let command = format!("{} hook pre-tool-use", shell_quote(&exe.display().to_string()));
-    let entry = json!({ "matcher": EDIT_TOOL, "hooks": [{ "type": "command", "command": command, "timeout": 10 }] });
+    push_hook(
+        settings,
+        "PreToolUse",
+        json!({ "matcher": EDIT_TOOL, "hooks": [{ "type": "command", "command": command, "timeout": 10 }] }),
+    );
+}
+
+/// What squeeze asks Claude Code's compaction to keep. Every request after a
+/// compaction re-reads the summary, so a short, task-focused one costs less;
+/// anything left out can be re-read from disk.
+pub const COMPACT_GUIDE: &str = "Write the summary for continuing this coding work, in at most about 1,500 words. \
+Keep: the user's current request and any earlier requests still open; decisions made and why; files changed or \
+created, with what changed; file paths and line ranges to revisit; the commands that build or test the work and \
+their latest results; errors still unresolved; the next steps. Leave out raw tool output, file contents, diffs and \
+logs (they can be read again) and finished work that no longer matters.";
+
+/// The PreCompact hook: hand Claude Code [`COMPACT_GUIDE`] as custom
+/// compaction instructions (merged with any the user gave to /compact).
+pub fn pre_compact(stdin: &str) -> Option<String> {
+    serde_json::from_str::<Value>(stdin).ok()?;
+    Some(json!({ "newCustomInstructions": COMPACT_GUIDE }).to_string())
+}
+
+/// Add the PreCompact hook ([`pre_compact`]) to session settings.
+pub fn add_compact_hook(settings: &mut Value, exe: &Path) {
+    let command = format!("{} hook pre-compact", shell_quote(&exe.display().to_string()));
+    push_hook(settings, "PreCompact", json!({ "hooks": [{ "type": "command", "command": command, "timeout": 10 }] }));
+}
+
+/// Switch the session's compression hook to `--profile aggressive`.
+pub fn set_aggressive(settings: &mut Value) {
+    for entry in settings.pointer_mut("/hooks/PostToolUse").and_then(Value::as_array_mut).into_iter().flatten() {
+        for h in entry["hooks"].as_array_mut().into_iter().flatten() {
+            if let Some(c) = h["command"].as_str()
+                && c.contains(" hook post-tool-use")
+                && !c.contains("--profile")
+            {
+                h["command"] = json!(format!("{c} --profile aggressive"));
+            }
+        }
+    }
+}
+
+fn push_hook(settings: &mut Value, event: &str, entry: Value) {
     if !settings.is_object() {
         *settings = json!({});
     }
     let hooks = settings.as_object_mut().expect("object").entry("hooks").or_insert_with(|| json!({}));
-    match hooks.get_mut("PreToolUse").and_then(Value::as_array_mut) {
+    match hooks.get_mut(event).and_then(Value::as_array_mut) {
         Some(list) => list.push(entry),
-        None => hooks["PreToolUse"] = json!([entry]),
+        None => hooks[event] = json!([entry]),
     }
 }
 
@@ -163,6 +210,22 @@ pub fn session_settings(exe: &Path, with_mcp: bool) -> Value {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn compaction_guide_and_profile_settings() {
+        let reply: Value = serde_json::from_str(&pre_compact(r#"{"trigger":"auto"}"#).unwrap()).unwrap();
+        assert_eq!(reply["newCustomInstructions"], COMPACT_GUIDE);
+        assert!(pre_compact("not json").is_none(), "a malformed payload changes nothing");
+
+        let exe = Path::new("/bin/squeeze");
+        let mut settings = session_settings(exe, true);
+        set_aggressive(&mut settings);
+        set_aggressive(&mut settings); // idempotent
+        add_compact_hook(&mut settings, exe);
+        let post = settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert_eq!(post, "/bin/squeeze hook post-tool-use --hint mcp --profile aggressive");
+        assert_eq!(settings["hooks"]["PreCompact"][0]["hooks"][0]["command"], "/bin/squeeze hook pre-compact");
+    }
 
     #[test]
     fn edit_many_follows_the_permission_mode() {

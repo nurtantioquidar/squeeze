@@ -34,11 +34,15 @@ enum Cmd {
     /// Claude Code hook entry point (registered for you by `squeeze run`)
     #[command(hide = true)]
     Hook {
-        /// Hook event: post-tool-use (compression) or pre-tool-use (edit_many permissions)
+        /// Hook event: post-tool-use (compression), pre-tool-use (edit_many permissions)
+        /// or pre-compact (compaction guidance)
         event: String,
         /// Where compressed-output notes point: mcp or cli
         #[arg(long, default_value = "cli")]
         hint: String,
+        /// Compression profile: default or aggressive
+        #[arg(long, default_value = "default")]
+        profile: String,
     },
     /// Run only the proxy, for use with ANTHROPIC_BASE_URL (API-key or gateway credentials only)
     Proxy(ProxyArgs),
@@ -121,10 +125,15 @@ struct RunArgs {
     #[arg(long)]
     trim_tools: bool,
     /// Have Claude Code compact the conversation within this many tokens of context
-    /// (it sets CLAUDE_CODE_AUTO_COMPACT_WINDOW; compaction starts somewhat below it).
-    /// Every request re-reads the whole context, so a smaller one costs less.
+    /// (it sets CLAUDE_CODE_AUTO_COMPACT_WINDOW; compaction starts somewhat below it), and
+    /// ask compaction for a short, task-focused summary. Every request re-reads the whole
+    /// context, so a smaller one costs less.
     #[arg(long, value_name = "TOKENS")]
     compact_window: Option<u64>,
+    /// Compress logs, diffs, searches and test output harder (from 1 KB, to about a third;
+    /// the original stays available through expand). File views stay verbatim.
+    #[arg(long)]
+    aggressive: bool,
     /// With --proxy: Claude Code authenticates through an apiKeyHelper in your settings
     #[arg(long)]
     api_key_helper: bool,
@@ -467,6 +476,12 @@ async fn cmd_run(a: RunArgs) -> Result<i32> {
     if !a.no_mcp && (a.edit_tool || a.replace_file_tools) {
         // edit_many is approved without asking exactly when Edit would be.
         squeeze::hook::add_edit_permission_hook(&mut settings, &exe);
+    }
+    if a.aggressive {
+        squeeze::hook::set_aggressive(&mut settings);
+    }
+    if a.compact_window.is_some() {
+        squeeze::hook::add_compact_hook(&mut settings, &exe);
     }
     if settings.as_object().is_some_and(|m| !m.is_empty()) {
         merge_settings_arg(&mut args, settings)?;
@@ -1232,14 +1247,15 @@ fn main() {
             println!("{text}");
             0
         }),
-        Cmd::Hook { event, hint } => {
+        Cmd::Hook { event, hint, profile } => {
             // Hooks must never break the session: any problem means "no change".
             let mut input = String::new();
             let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
             let hint = if hint == "mcp" { ExpandHint::Mcp } else { ExpandHint::Cli };
             let reply = match event.as_str() {
-                "post-tool-use" => squeeze::hook::run(&input, hint),
+                "post-tool-use" => squeeze::hook::run(&input, hint, profile == "aggressive"),
                 "pre-tool-use" => squeeze::hook::pre_tool_use(&input),
+                "pre-compact" => squeeze::hook::pre_compact(&input),
                 _ => None,
             };
             if let Some(reply) = reply {

@@ -443,7 +443,9 @@ async fn session_inner(
         r#"{"mcpServers":{}}"#.to_string()
     };
     let settings = if arm.uses_hook() {
-        Some(crate::hook::session_settings(&exe, arm.uses_mcp()))
+        let mut s = crate::hook::session_settings(&exe, arm.uses_mcp());
+        arm.tune_settings(&mut s, &exe);
+        Some(s)
     } else if arm.uses_mcp() {
         Some(json!({ "permissions": { "allow": arm.tool_names() } }))
     } else {
