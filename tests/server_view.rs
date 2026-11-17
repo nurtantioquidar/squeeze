@@ -401,7 +401,9 @@ fn the_emulated_api_refuses_what_the_api_refuses() {
         json!([{ "type": "text", "text": "look", "cache_control": { "type": "ephemeral" } }]);
     assert_eq!(refusal(&api, BETAS, &fine), None);
     let served = api.served().pop().unwrap();
-    assert_eq!((served.cleared("cleared_tool_uses"), served.cleared("cleared_thinking_turns")), (2, 2));
+    // Two thinking turns as the API counts them: the prompt, and the reminder
+    // next to the first results. The current one is kept.
+    assert_eq!((served.cleared("cleared_tool_uses"), served.cleared("cleared_thinking_turns")), (2, 1));
     let drop_thinking = |b: &mut Value, at: usize| b["messages"][at]["content"].as_array_mut().unwrap().remove(0);
     let mut front = base.clone();
     drop_thinking(&mut front, 1);

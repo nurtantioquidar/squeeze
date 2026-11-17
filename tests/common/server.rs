@@ -139,25 +139,44 @@ fn header(m: &Value) -> u64 {
     hash_without(m, &["content"])
 }
 
-/// Each message's thinking turn, for assistant messages in a turn that has had thinking so far.
-fn thinking_turns(messages: &[Value]) -> Vec<Option<u64>> {
-    let (mut n, mut in_turn, mut counted) = (0, false, false);
-    messages
+/// Starts a thinking turn as the API counts them for `clear_thinking`: a user
+/// message holding anything besides tool results (measured on the API,
+/// 2026-11-17). The current turn counts.
+pub fn starts_turn(m: &Value) -> bool {
+    m["role"] == "user"
+        && match &m["content"] {
+            Value::Array(items) => items.iter().any(|b| b["type"] != "tool_result"),
+            _ => true,
+        }
+}
+
+/// Each assistant message's thinking turn, and how many turns there are.
+fn thinking_turns(messages: &[Value]) -> (Vec<Option<u64>>, u64) {
+    let mut n = 0;
+    let turns = messages
         .iter()
         .map(|m| {
-            if m["role"] != "assistant" {
-                in_turn = false;
-                return None;
-            }
-            if !in_turn {
-                (in_turn, counted) = (true, false);
-            }
-            if !counted && blocks(m).iter().any(is_thinking) {
-                (counted, n) = (true, n + 1);
-            }
-            counted.then_some(n)
+            n += u64::from(starts_turn(m));
+            (m["role"] == "assistant").then_some(n)
         })
-        .collect()
+        .collect();
+    (turns, n)
+}
+
+/// The API leaves a tool use out of `keep` and `trigger` when its result is too
+/// short to be worth clearing: under 47 characters of text, unless it's empty
+/// or holds something besides text, or `clear_tool_inputs` is on (measured on
+/// the API, 2026-11-17).
+pub fn counted_use(result: Option<&Value>, inputs: bool) -> bool {
+    let chars: usize = match result.map(|r| &r["content"]) {
+        Some(Value::String(s)) => s.chars().count(),
+        Some(Value::Array(items)) if items.iter().all(|b| b["type"] == "text") => {
+            items.iter().filter_map(|b| b["text"].as_str()).map(|t| t.chars().count()).sum()
+        }
+        Some(Value::Array(_)) => return true,
+        _ => 0,
+    };
+    inputs || chars == 0 || chars >= 47
 }
 
 /// A request's messages once its context edits are applied, and what they cleared.
@@ -213,8 +232,8 @@ pub fn cleared(body: &Value) -> Result<Cleared, String> {
                         _ => return Err(format!("{at}.keep: \"all\" or {{type: thinking_turns, value: 1 or more}}")),
                     },
                 };
-                let turns = thinking_turns(&messages);
-                let cut = turns.iter().flatten().max().copied().unwrap_or(0).saturating_sub(keep);
+                let (turns, n) = thinking_turns(&messages);
+                let cut = n.saturating_sub(keep);
                 let mut freed = 0.0;
                 for (m, turn) in messages.iter_mut().zip(&turns) {
                     if turn.is_some_and(|t| t <= cut)
@@ -246,12 +265,19 @@ pub fn cleared(body: &Value) -> Result<Cleared, String> {
                     None => false,
                     Some(v) => v.as_bool().ok_or(format!("{at}.clear_tool_inputs: a boolean"))?,
                 };
+                let results: HashMap<String, Value> = messages
+                    .iter()
+                    .flat_map(|m| blocks(m).into_owned())
+                    .filter(|b| b["type"] == "tool_result")
+                    .filter_map(|b| b["tool_use_id"].as_str().map(|id| (id.to_string(), b.clone())))
+                    .collect();
                 let uses: Vec<String> = messages
                     .iter()
                     .filter(|m| m["role"] == "assistant")
                     .flat_map(|m| blocks(m).into_owned())
                     .filter(|b| b["type"] == "tool_use" && !b["name"].as_str().is_some_and(|n| excluded.contains(&n)))
                     .filter_map(|b| b["id"].as_str().map(str::to_string))
+                    .filter(|id| counted_use(results.get(id), inputs))
                     .collect();
                 let size = match trigger_kind.as_str() {
                     "tool_uses" => uses.len() as f64,

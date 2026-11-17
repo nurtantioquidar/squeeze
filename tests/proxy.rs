@@ -513,11 +513,12 @@ fn edits(r: &common::Recorded) -> Value {
 }
 
 /// The edits pinned by an advance at `cm_conversation(6, 4)`, as sent with
-/// `cm_conversation(6, second)`: 6 tool uses and 8 thinking turns cleared.
+/// `cm_conversation(6, second)`: 6 tool uses cleared, and the thinking of the
+/// first of its two turns (one per human prompt).
 fn pinned(second: usize) -> Value {
-    let (n, n_th) = (6 + second, 8 + second);
+    let n = 6 + second;
     json!([
-        { "type": "clear_thinking_20251015", "keep": { "type": "thinking_turns", "value": n_th - 8 } },
+        { "type": "clear_thinking_20251015", "keep": { "type": "thinking_turns", "value": 1 } },
         { "type": "clear_tool_uses_20250919", "trigger": { "type": "tool_uses", "value": n - 1 },
           "keep": { "type": "tool_uses", "value": n - 6 }, "exclude_tools": ["TodoWrite"] }
     ])
@@ -564,7 +565,7 @@ async fn cm_advances_at_a_cold_moment_and_keeps_the_cleared_set_pinned() {
     }
 
     // Cold: all but the newest 4 of 10 clearable uses, and the thinking from
-    // before the latest prompt (8 of 12 turns). Messages untouched.
+    // before the latest prompt (the first of 2 turns). Messages untouched.
     let body = cm_conversation(6, 4);
     let up = cm_send(&url, &mock, &clock, T0 + 100 + 306, MESSAGES, &body).await.json();
     assert_eq!(up["messages"], body["messages"], "message bytes are never edited");
@@ -575,7 +576,7 @@ async fn cm_advances_at_a_cold_moment_and_keeps_the_cleared_set_pinned() {
     sent.as_object_mut().unwrap().remove("context_management");
     assert_eq!(rest, sent, "every other field as sent");
 
-    // Warm turns after it keep the same 6 uses and 8 thinking turns cleared.
+    // Warm turns after it keep the same 6 uses and 1 thinking turn cleared.
     for (i, second) in [5, 6, 9].into_iter().enumerate() {
         let body = cm_conversation(6, second);
         let up = cm_send(&url, &mock, &clock, T0 + 410 + i as u64, MESSAGES, &body).await;
@@ -588,11 +589,11 @@ async fn cm_advances_at_a_cold_moment_and_keeps_the_cleared_set_pinned() {
     let adv = &lines[2];
     assert_eq!(
         (adv["advance"].clone(), adv["C"].clone(), adv["C_th"].clone(), adv["K"].clone()),
-        (json!(true), json!(6), json!(8), json!(4))
+        (json!(true), json!(6), json!(1), json!(4))
     );
     assert_eq!(adv["applied"]["cleared_tool_uses"], 6);
     let cleared = adv["cleared_input_tokens"].as_u64().unwrap();
-    assert!(cleared > 6 * 1000, "six ~5 KB results and eight thinking blocks: {cleared}");
+    assert!(cleared > 6 * 1000, "six ~5 KB results and the first turn's thinking: {cleared}");
     assert!(lines.iter().all(|l| l["breakers"] == json!([])), "{lines:?}");
     assert_eq!(lines[3]["cold"], false);
     let t = proxy.totals();

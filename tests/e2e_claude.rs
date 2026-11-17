@@ -454,15 +454,15 @@ async fn real_claude_code_with_context_edits() {
         // Pinned: the oldest C uses and C_th thinking turns, as the server reported.
         let (c, c_th) = (line["C"].as_u64().unwrap(), line["C_th"].as_u64().unwrap());
         assert_eq!(line["advance"], cold.contains(&i), "{i}: an advance at each cold moment, and only there");
-        let uses = b["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|m| server::blocks(m).into_owned())
-            .filter(|x| x["type"] == "tool_use");
-        let n = uses.count() as u64;
-        let thinking_turns =
-            b["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "assistant").count() as u64;
+        // Counted as the API counts: uses whose results are worth clearing, and
+        // one thinking turn per user message with anything besides tool results.
+        let blocks: Vec<Value> =
+            b["messages"].as_array().unwrap().iter().flat_map(|m| server::blocks(m).into_owned()).collect();
+        let result = |id: &Value| blocks.iter().find(|x| x["type"] == "tool_result" && x["tool_use_id"] == *id);
+        let n =
+            blocks.iter().filter(|x| x["type"] == "tool_use" && server::counted_use(result(&x["id"]), false)).count()
+                as u64;
+        let thinking_turns = b["messages"].as_array().unwrap().iter().filter(|m| server::starts_turn(m)).count() as u64;
         let mut ours = json!({ "type": "clear_tool_uses_20250919", "trigger": { "type": "tool_uses", "value": n - 1 },
                                "keep": { "type": "tool_uses", "value": n - c } });
         // Every offered tool but the clearable ones (none, with `--bare`'s Bash, Edit and Read).

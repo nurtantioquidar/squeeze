@@ -768,29 +768,16 @@ impl Cache {
 #[derive(Default)]
 struct ThinkingTurns {
     n: u64,
-    in_turn: bool,
-    counted: bool,
 }
 
 impl ThinkingTurns {
-    /// The thinking turn `m` is part of, if its turn has had thinking so far.
+    /// The thinking turn an assistant message `m` is part of. Turns start at
+    /// user messages as the server counts them ([`ctxmgmt::starts_turn`]).
     fn next(&mut self, m: &Value) -> Option<u64> {
-        if m["role"] != "assistant" {
-            self.in_turn = false;
-            return None;
+        if ctxmgmt::starts_turn(m) {
+            self.n += 1;
         }
-        if !self.in_turn {
-            (self.in_turn, self.counted) = (true, false);
-        }
-        let thinking = m["content"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|b| matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking")));
-        if thinking && !self.counted {
-            (self.counted, self.n) = (true, self.n + 1);
-        }
-        self.counted.then_some(self.n)
+        (m["role"] == "assistant").then_some(self.n)
     }
 }
 
@@ -805,10 +792,16 @@ struct Cleared {
     thinking_turns: u64,
 }
 
-/// A request's `context_management` edits as the server would apply them,
-/// under the counting convention ctxmgmt assumes.
+/// A request's `context_management` edits as the server applies them (the
+/// counting measured on the API; see ctxmgmt's module docs).
 fn server_clears(body: &Value) -> Cleared {
     let messages = body["messages"].as_array().map_or(&[][..], Vec::as_slice);
+    let results: HashMap<&str, &Value> = messages
+        .iter()
+        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+        .filter(|b| b["type"] == "tool_result")
+        .filter_map(|b| b["tool_use_id"].as_str().map(|id| (id, b)))
+        .collect();
     let mut out = Cleared::default();
     for e in body["context_management"]["edits"].as_array().into_iter().flatten() {
         let keep = e["keep"]["value"].as_u64();
@@ -823,18 +816,20 @@ fn server_clears(body: &Value) -> Cleared {
                 let (Some(keep), Some(trigger)) = (keep, e["trigger"]["value"].as_u64()) else { continue };
                 let excluded: HashSet<&str> =
                     e["exclude_tools"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                let inputs = e["clear_tool_inputs"] == true;
                 let uses: Vec<&str> = messages
                     .iter()
                     .filter(|m| m["role"] == "assistant")
                     .flat_map(|m| m["content"].as_array().into_iter().flatten())
                     .filter(|b| b["type"] == "tool_use" && !b["name"].as_str().is_some_and(|n| excluded.contains(n)))
                     .filter_map(|b| b["id"].as_str())
+                    .filter(|id| ctxmgmt::counts_toward_keep(results.get(id).copied(), inputs))
                     .collect();
                 if uses.len() as u64 > trigger {
                     let n = uses.len().saturating_sub(keep as usize);
                     out.ids = uses[..n].iter().map(|s| s.to_string()).collect();
                     out.tool_uses = n as u64;
-                    out.inputs = e["clear_tool_inputs"] == true;
+                    out.inputs = inputs;
                 }
             }
             _ => {}
@@ -900,7 +895,7 @@ fn simulate(s: &Session, cal: &Calibration, cfg: &SimConfig, edits: bool) -> Run
                 }
             }
             run.refilled.extend(refills.keys().cloned());
-            let census = ctxmgmt::census(&body, &c.betas);
+            let census = ctxmgmt::census(&body, &c.betas, cfg.ctx.clear_inputs);
             advanced = ctxmgmt::step(&mut state, &census, &cfg.ctx, proxy_cold).is_some();
             run.advances += usize::from(advanced);
             pinned = ctxmgmt::apply(&mut body, &census, &state);
@@ -1443,6 +1438,12 @@ mod tests {
             json!({ "role": "assistant", "content": content })
         };
         let r = |id: &str| json!({ "role": "user", "content": [{ "type": "tool_result", "tool_use_id": id, "content": "x" }] });
+        // Claude Code's results with a reminder next to them: the server starts a turn there.
+        let mixed = |id: &str| {
+            json!({ "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": id, "content": "x" }, { "type": "text", "text": "<system-reminder>" }
+        ] })
+        };
         let body = json!({
             "context_management": { "edits": [
                 { "type": CLEAR_THINKING, "keep": { "type": "thinking_turns", "value": 1 } },
@@ -1452,20 +1453,28 @@ mod tests {
             "messages": [
                 json!({ "role": "user", "content": "go" }),
                 a("u1", "Bash", true), r("u1"),
-                a("todo", "TodoWrite", true), r("todo"),
-                // Consecutive assistant messages are one thinking turn.
+                a("todo", "TodoWrite", false), mixed("todo"),
                 a("u2", "Read", true), a("u3", "Grep", true), r("u2"), r("u3"),
                 json!({ "role": "system", "content": "notice" }),
+                json!({ "role": "user", "content": [{ "type": "text", "text": "next" }] }),
                 a("u4", "Bash", true), r("u4"),
             ]
         });
         let c = server_clears(&body);
         let mut ids: Vec<&str> = c.ids.iter().map(String::as_str).collect();
         ids.sort();
-        assert_eq!((ids, c.tool_uses, c.inputs, c.thinking_turns), (vec!["u1", "u2", "u3"], 3, true, 3));
+        // Three turns (the prompt, the reminder, the next prompt), with or without thinking; one kept.
+        assert_eq!((ids, c.tool_uses, c.inputs, c.thinking_turns), (vec!["u1", "u2", "u3"], 3, true, 2));
         let mut turns = ThinkingTurns::default();
         let numbered: Vec<Option<u64>> = body["messages"].as_array().unwrap().iter().map(|m| turns.next(m)).collect();
-        assert_eq!(numbered, [None, Some(1), None, Some(2), None, Some(3), Some(3), None, None, None, Some(4), None]);
+        assert_eq!(
+            numbered,
+            [None, Some(1), None, Some(1), None, Some(2), Some(2), None, None, None, None, Some(3), None]
+        );
+        // Without clear_tool_inputs, 1-character results don't count toward the trigger.
+        let mut results_only = body.clone();
+        results_only["context_management"]["edits"][1]["clear_tool_inputs"] = json!(false);
+        assert!(server_clears(&results_only).ids.is_empty());
         // Under the trigger nothing is cleared.
         let mut few = body.clone();
         few["context_management"]["edits"][1]["trigger"]["value"] = json!(4);

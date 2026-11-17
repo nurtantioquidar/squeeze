@@ -366,7 +366,7 @@ fn ctx_step(
     tick: &Tick,
     is_messages: bool,
 ) -> CtxRequest {
-    let census = ctxmgmt::census(body, &header_str(headers, "anthropic-beta").unwrap_or_default());
+    let census = ctxmgmt::census(body, &header_str(headers, "anthropic-beta").unwrap_or_default(), cfg.clear_inputs);
     let (state, advance) = {
         let mut threads = lock(&inner.threads);
         if is_messages && let Some(thread) = threads.get_mut(&tick.key) {

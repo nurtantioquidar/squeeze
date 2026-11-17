@@ -14,11 +14,15 @@
 //! state is lost goes out as the client sent it: one cache rebuild, never a
 //! rejected request.
 //!
-//! Counting convention, until the count_tokens calibration probe settles it:
-//! `keep` and `trigger` count the uses of tools outside `exclude_tools`, each
-//! parallel use on its own; a thinking turn is an assistant message
-//! (consecutive ones merged) with a thinking block. The `ctx_mismatch` breaker
-//! stops advancing a thread whose server counts otherwise.
+//! Counting convention, as measured on the API (probe-cache-key-v2,
+//! 2026-11-17): `keep` and `trigger` count the uses of tools outside
+//! `exclude_tools`, each parallel use on its own, but only uses whose result is
+//! worth clearing ([`counts_toward_keep`]); a thinking turn starts at each user
+//! message that holds anything besides tool results ([`starts_turn`]), and the
+//! current turn counts. The `context_management` values themselves are not part
+//! of the prompt-cache key: requests that only change `keep` and `trigger`
+//! read the whole previous prompt from cache. The `ctx_mismatch` breaker stops
+//! advancing a thread whose server counts otherwise.
 
 use crate::sse::{AppliedEdits, Usage};
 use crate::store::CtxState;
@@ -133,9 +137,9 @@ pub struct Census {
     /// image results count too: `exclude_tools` can only exclude whole tools,
     /// so the server clears those like any other.
     pub uses: Vec<ToolUse>,
-    /// Assistant turns with thinking.
+    /// Thinking turns as the server counts them ([`starts_turn`]), the current one included.
     pub n_th: u64,
-    /// Thinking turns before the latest human prompt.
+    /// Thinking turns before the current one.
     pub th_before_human: u64,
     /// Clearable uses since the start of the previous human turn.
     pub uses_since_prev_human: usize,
@@ -167,6 +171,42 @@ fn block_type(b: &Value) -> Option<&str> {
 /// A human prompt: a user message that isn't returning tool results.
 fn is_human(m: &Value) -> bool {
     role(m) == Some("user") && !blocks(m).iter().any(|b| block_type(b) == Some("tool_result"))
+}
+
+/// Starts a thinking turn as the server counts them for `clear_thinking`: a
+/// user message holding anything besides tool results (a prompt, or the text
+/// Claude Code adds next to results).
+pub fn starts_turn(m: &Value) -> bool {
+    role(m) == Some("user")
+        && match m.get("content") {
+            Some(Value::Array(items)) => items.iter().any(|b| block_type(b) != Some("tool_result")),
+            _ => true,
+        }
+}
+
+/// Results shorter than this many characters aren't worth clearing, and the
+/// server leaves their uses out of its `keep` and `trigger` count.
+pub const MIN_COUNTED_RESULT_CHARS: usize = 47;
+
+/// Whether the server counts a tool use toward `keep` and `trigger`, given its
+/// `tool_result` block: when the result has [`MIN_COUNTED_RESULT_CHARS`] or more
+/// characters of text, is empty (the server fills one in), or holds an image or
+/// a document. With `clear_tool_inputs` every use counts.
+pub fn counts_toward_keep(result: Option<&Value>, clear_inputs: bool) -> bool {
+    if clear_inputs {
+        return true;
+    }
+    let chars: usize = match result.and_then(|r| r.get("content")) {
+        Some(Value::String(s)) => s.chars().count(),
+        Some(Value::Array(items)) => {
+            if items.iter().any(|b| block_type(b) != Some("text")) {
+                return true;
+            }
+            items.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).map(|t| t.chars().count()).sum()
+        }
+        _ => 0,
+    };
+    chars == 0 || chars >= MIN_COUNTED_RESULT_CHARS
 }
 
 fn clearable_uses(m: &Value) -> impl Iterator<Item = &Value> {
@@ -213,14 +253,14 @@ fn edits(body: &Value) -> Option<&Vec<Value>> {
     body.get("context_management")?.get("edits")?.as_array()
 }
 
-pub fn census(body: &Value, betas: &str) -> Census {
+pub fn census(body: &Value, betas: &str, clear_inputs: bool) -> Census {
     let messages = body.get("messages").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-    let mut result_bytes: HashMap<&str, usize> = HashMap::new();
+    let mut results: HashMap<&str, &Value> = HashMap::new();
     for b in messages.iter().filter(|m| role(m) == Some("user")).flat_map(blocks) {
         if block_type(b) == Some("tool_result")
             && let Some(id) = b.get("tool_use_id").and_then(Value::as_str)
         {
-            *result_bytes.entry(id).or_default() += crate::transform::text_len(b);
+            results.insert(id, b);
         }
     }
 
@@ -233,25 +273,13 @@ pub fn census(body: &Value, betas: &str) -> Census {
         .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
         .collect();
     let mut humans = Vec::new();
-    let mut in_assistant_turn = false;
-    let mut turn_has_thinking = false;
     for m in messages {
         if role(m) != Some("assistant") {
-            in_assistant_turn = false;
+            c.n_th += u64::from(starts_turn(m));
             if is_human(m) {
                 humans.push(c.uses.len());
-                c.th_before_human = c.n_th;
             }
             continue;
-        }
-        if !in_assistant_turn {
-            (in_assistant_turn, turn_has_thinking) = (true, false);
-        }
-        if !turn_has_thinking
-            && blocks(m).iter().any(|b| matches!(block_type(b), Some("thinking" | "redacted_thinking")))
-        {
-            turn_has_thinking = true;
-            c.n_th += 1;
         }
         for b in blocks(m).iter().filter(|b| block_type(b) == Some("tool_use")) {
             let (Some(id), Some(name)) = (b.get("id").and_then(Value::as_str), b.get("name").and_then(Value::as_str))
@@ -259,16 +287,19 @@ pub fn census(body: &Value, betas: &str) -> Census {
                 continue;
             };
             names.insert(name.to_string());
-            if is_clearable(name) {
+            let result = results.get(id).copied();
+            if is_clearable(name) && counts_toward_keep(result, clear_inputs) {
                 let input_bytes = b.get("input").map_or(0, |i| i.to_string().len());
+                let result_bytes = result.map_or(0, crate::transform::text_len);
                 c.uses.push(ToolUse {
                     id: id.to_string(),
-                    result_tokens: RESULT_TOKENS_PER_4_BYTES * result_bytes.get(id).copied().unwrap_or(0) as f64 / 4.0,
+                    result_tokens: RESULT_TOKENS_PER_4_BYTES * result_bytes as f64 / 4.0,
                     input_tokens: INPUT_TOKENS_PER_4_BYTES * input_bytes as f64 / 4.0,
                 });
             }
         }
     }
+    c.th_before_human = c.n_th.saturating_sub(1);
     c.uses_since_prev_human = c.uses.len() - prev_turn_start(&humans);
     c.exclude_tools = names.into_iter().filter(|n| !is_clearable(n)).collect();
     c.beta = betas.split(',').any(|b| b.trim() == BETA);
@@ -510,6 +541,14 @@ mod tests {
     /// above: tool use ids, and thinking turns.
     fn server_clears(body: &Value) -> (Vec<String>, u64) {
         let edits = body["context_management"]["edits"].as_array().unwrap();
+        let results: HashMap<&str, &Value> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(blocks)
+            .filter(|b| block_type(b) == Some("tool_result"))
+            .map(|b| (b["tool_use_id"].as_str().unwrap(), b))
+            .collect();
         let mut ids = Vec::new();
         let mut thinking = 0;
         for e in edits {
@@ -525,7 +564,9 @@ mod tests {
                         .filter(|b| {
                             block_type(b) == Some("tool_use") && !excluded.contains(&b["name"].as_str().unwrap())
                         })
-                        .map(|b| b["id"].as_str().unwrap().to_string())
+                        .map(|b| b["id"].as_str().unwrap())
+                        .filter(|id| counts_toward_keep(results.get(id).copied(), e["clear_tool_inputs"] == true))
+                        .map(str::to_string)
                         .collect();
                     let (keep, trigger) =
                         (e["keep"]["value"].as_u64().unwrap(), e["trigger"]["value"].as_u64().unwrap());
@@ -535,7 +576,7 @@ mod tests {
                 }
                 Some(CLEAR_THINKING) => {
                     if let Some(keep) = e["keep"]["value"].as_u64() {
-                        thinking = census(body, BETAS).n_th - keep;
+                        thinking = census(body, BETAS, false).n_th - keep;
                     }
                 }
                 _ => {}
@@ -547,7 +588,7 @@ mod tests {
     /// Advance at a cold moment, then apply.
     fn advanced(b: &mut Value, k: usize) -> (CtxState, Option<Expected>) {
         let mut s = CtxState::default();
-        let c = census(b, BETAS);
+        let c = census(b, BETAS, false);
         assert!(step(&mut s, &c, &cfg(k), true).is_some(), "expected an advance");
         let e = apply(b, &c, &s);
         (s, e)
@@ -574,12 +615,18 @@ mod tests {
             json!({ "role": "assistant", "content": [{ "type": "text", "text": "done" }] }),
             human("thanks"),
         ];
-        let c = census(&body(messages), BETAS);
+        let c = census(&body(messages.clone()), BETAS, false);
         let ids: Vec<&str> = c.uses.iter().map(|u| u.id.as_str()).collect();
-        assert_eq!(ids, ["err", "img", "g"], "parallel uses one by one, error and image results included");
+        assert_eq!(
+            ids,
+            ["err", "img"],
+            "parallel uses one by one, error and image results included; 3-char results not"
+        );
         assert!((c.uses[0].result_tokens - 1.78 * 400.0 / 4.0).abs() < 1e-9);
-        assert_eq!(c.n_th, 1, "consecutive assistant messages are one turn");
-        assert_eq!((c.th_before_human, c.uses_since_prev_human), (1, 3));
+        assert_eq!(c.n_th, 2, "one turn per human prompt, the current one included");
+        assert_eq!((c.th_before_human, c.uses_since_prev_human), (1, 2));
+        let ids: Vec<String> = census(&body(messages), BETAS, true).uses.into_iter().map(|u| u.id).collect();
+        assert_eq!(ids, ["err", "img", "g"], "with clear_tool_inputs every use counts");
         assert_eq!(c.exclude_tools, ["TodoWrite"]);
         assert!(c.beta && c.field && c.thinking_keep_all && !c.client_clears);
     }
@@ -588,21 +635,34 @@ mod tests {
     fn keep_stays_pinned_as_turns_are_appended() {
         let mut b = body(convo(6, 3));
         let (s, e) = advanced(&mut b, 4);
-        assert_eq!(e, Some(Expected { tool_uses: 5, thinking_turns: Some(7) }));
+        assert_eq!(e, Some(Expected { tool_uses: 5, thinking_turns: Some(1) }));
         let pinned = server_clears(&b);
         assert_eq!(pinned.0, ["a0", "a1", "a2", "a3", "a4"]);
-        assert_eq!(pinned.1, 7);
+        assert_eq!(pinned.1, 1);
         for more in [1, 5, 20] {
             let mut later = body(convo(6, 3 + more));
             let mut st = s.clone();
-            let c = census(&later, BETAS);
+            let c = census(&later, BETAS, false);
             assert_eq!(step(&mut st, &c, &cfg(4), false), None, "a warm request never advances");
             assert_eq!(apply(&mut later, &c, &st), e);
             assert_eq!(server_clears(&later), pinned, "{more} turns later");
             let edits = later["context_management"]["edits"].as_array().unwrap();
             assert_eq!(edits[1]["keep"]["value"], json!(9 + more - 5));
-            assert_eq!(edits[0]["keep"]["value"], json!(10 + more - 7));
+            assert_eq!(edits[0]["keep"]["value"], json!(1));
         }
+        // New turns, from a prompt or from a reminder next to results, grow the thinking keep.
+        let mut messages = convo(6, 3);
+        messages.push(json!({ "role": "assistant", "content": [{ "type": "text", "text": "done" }] }));
+        messages.push(human("one more thing"));
+        messages.extend(tool_loop("c0", "Bash"));
+        let reminder = json!({ "type": "text", "text": "<system-reminder>todos</system-reminder>" });
+        messages.last_mut().unwrap()["content"].as_array_mut().unwrap().push(reminder);
+        let mut later = body(messages);
+        let c = census(&later, BETAS, false);
+        assert_eq!(c.n_th, 4);
+        assert_eq!(apply(&mut later, &c, &s), e);
+        assert_eq!(later["context_management"]["edits"][0]["keep"]["value"], json!(3));
+        assert_eq!(server_clears(&later), pinned);
     }
 
     #[test]
@@ -626,10 +686,10 @@ mod tests {
         messages.pop();
         messages.push(human("next ticket"));
         let mut b = body(messages);
-        let c = census(&b, BETAS);
-        assert_eq!((c.n_th, c.th_before_human), (9, 9));
+        let c = census(&b, BETAS, false);
+        assert_eq!((c.n_th, c.th_before_human), (2, 1));
         let (_, e) = advanced(&mut b, 4);
-        assert_eq!(e.unwrap().thinking_turns, Some(8));
+        assert_eq!(e.unwrap().thinking_turns, Some(1));
         assert_eq!(b["context_management"]["edits"][0]["keep"], json!({ "type": "thinking_turns", "value": 1 }));
     }
 
@@ -638,7 +698,7 @@ mod tests {
         let original = body(convo(6, 3));
         let mut b = original.clone();
         let mut s = CtxState::default();
-        let c = census(&b, BETAS);
+        let c = census(&b, BETAS, false);
         assert_eq!(step(&mut s, &c, &cfg(4), false), None);
         assert_eq!(apply(&mut b, &c, &s), None);
         assert_eq!(b, original, "warm, nothing cleared yet");
@@ -650,7 +710,7 @@ mod tests {
                 b.as_object_mut().unwrap().remove("context_management");
             }
             let mut s = CtxState::default();
-            let c = census(&b, betas);
+            let c = census(&b, betas, false);
             assert_eq!(step(&mut s, &c, &cfg(4), true), None, "no advance without the beta and field");
             assert_eq!(apply(&mut b, &c, &pinned), None, "a pinned thread passes through too");
             let mut expect = original.clone();
@@ -670,13 +730,13 @@ mod tests {
             .unwrap()
             .push(json!({ "type": CLEAR_TOOL_USES, "keep": { "type": "tool_uses", "value": 3 } }));
         let original = b.clone();
-        let c = census(&b, BETAS);
+        let c = census(&b, BETAS, false);
         assert_eq!(step(&mut s, &c, &cfg(4), true), None);
         assert_eq!(apply(&mut b, &c, &s), None);
         assert_eq!(b, original);
         // It stays the client's from then on, even when a request omits it.
         let mut next = body(convo(6, 4));
-        let c = census(&next, BETAS);
+        let c = census(&next, BETAS, false);
         assert!(s.client_managed);
         assert_eq!(step(&mut s, &c, &cfg(4), true), None);
         assert_eq!(apply(&mut next, &c, &s), None);
@@ -691,21 +751,21 @@ mod tests {
         compacted.extend((0..9).flat_map(|i| tool_loop(&format!("c{i}"), "Bash")));
         let mut b = body(compacted);
         let original = b.clone();
-        let c = census(&b, BETAS);
+        let c = census(&b, BETAS, false);
         assert_eq!(step(&mut s, &c, &cfg(4), false), None);
         assert_eq!((s.cleared, s.cleared_upto_id.as_deref(), s.cleared_th), (0, None, 0));
         assert_eq!(apply(&mut b, &c, &s), None);
         assert_eq!(b, original);
         // Rewound to before the cut: the same.
         let (mut s, _) = advanced(&mut body(convo(6, 3)), 4);
-        assert!(!lines_up(&census(&body(convo(4, 0)), BETAS), &s));
-        step(&mut s, &census(&body(convo(4, 0)), BETAS), &cfg(4), false);
+        assert!(!lines_up(&census(&body(convo(4, 0)), BETAS, false), &s));
+        step(&mut s, &census(&body(convo(4, 0)), BETAS, false), &cfg(4), false);
         assert_eq!(s.cleared, 0);
     }
 
     #[test]
     fn count_tokens_and_warm_requests_never_advance() {
-        let c = census(&body(convo(6, 3)), BETAS);
+        let c = census(&body(convo(6, 3)), BETAS, false);
         assert_eq!(plan_advance(&c, &CtxState::default(), &cfg(4), false), None);
         assert!(plan_advance(&c, &CtxState::default(), &cfg(4), true).is_some());
     }
@@ -713,9 +773,9 @@ mod tests {
     #[test]
     fn exclude_tools_grows_when_a_new_tool_appears() {
         let mut messages = convo(6, 3);
-        let before = census(&body(messages.clone()), BETAS).exclude_tools;
+        let before = census(&body(messages.clone()), BETAS, false).exclude_tools;
         messages.extend(tool_loop("m0", "mcp__linear__get_issue"));
-        let after = census(&body(messages), BETAS);
+        let after = census(&body(messages), BETAS, false);
         assert_eq!(before, ["TodoWrite"]);
         assert_eq!(after.exclude_tools, ["TodoWrite", "mcp__linear__get_issue"]);
         assert_eq!(after.uses.len(), 9, "an excluded tool's use isn't counted");
@@ -723,7 +783,7 @@ mod tests {
 
     #[test]
     fn an_advance_needs_two_more_uses_and_5k_more_tokens() {
-        let c = census(&body(convo(6, 3)), BETAS);
+        let c = census(&body(convo(6, 3)), BETAS, false);
         let at = |cleared: u64| CtxState {
             cleared,
             cleared_upto_id: Some(format!("a{}", cleared - 1)),
@@ -739,7 +799,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(plan_advance(&census(&small, BETAS), &CtxState::default(), &cfg(4), true), None);
+        assert_eq!(plan_advance(&census(&small, BETAS, false), &CtxState::default(), &cfg(4), true), None);
         // Clearing inputs too counts their tokens, and pins the choice.
         let inputs = CtxConfig { clear_inputs: true, ..cfg(4) };
         let a = plan_advance(&c, &CtxState::default(), &inputs, true).unwrap();
@@ -751,10 +811,10 @@ mod tests {
     #[test]
     fn the_keep_window_covers_the_previous_human_turn() {
         // 6 uses before the latest prompt and 3 after: K = 9 within 4..24.
-        let c = census(&body(convo(6, 3)), BETAS);
+        let c = census(&body(convo(6, 3)), BETAS, false);
         assert_eq!(c.uses_since_prev_human, 9);
         assert_eq!(plan_advance(&c, &CtxState::default(), &CtxConfig::default(), true), None, "K 9 >= n");
-        let c = census(&body(convo(30, 3)), BETAS);
+        let c = census(&body(convo(30, 3)), BETAS, false);
         assert_eq!(c.uses_since_prev_human, 33);
         assert_eq!(plan_advance(&c, &CtxState::default(), &CtxConfig::default(), true).unwrap().cleared, 33 - 24);
         let w = KeepWindow::default();
@@ -787,18 +847,18 @@ mod tests {
     fn breakers() {
         let (pinned, e) = advanced(&mut body(convo(6, 3)), 4);
         let e = e.unwrap();
-        let ok = Some((5, 7));
+        let ok = Some((5, 1));
         let none: Vec<&str> = Vec::new();
 
         let mut s = pinned.clone();
         assert_eq!(settle(&mut s, e, false, OPUS, Some(&usage(50_000, ok)), 200), none);
         assert_eq!(s.last_prompt, 50_100);
         assert_eq!(settle(&mut s, e, true, OPUS, Some(&usage(50_000, ok)), 200), none, "the cache held");
-        assert_eq!(settle(&mut s, e, false, OPUS, Some(&usage(0, Some((4, 7)))), 200), [CTX_MISMATCH]);
+        assert_eq!(settle(&mut s, e, false, OPUS, Some(&usage(0, Some((4, 1)))), 200), [CTX_MISMATCH]);
         assert_eq!(settle(&mut s.clone(), e, false, OPUS, Some(&usage(0, None)), 200), [CTX_MISMATCH], "none reported");
         assert_eq!(s.frozen.as_deref(), Some(CTX_MISMATCH));
         assert_eq!(s.cleared, 5, "a frozen thread stays pinned");
-        let c = census(&body(convo(6, 20)), BETAS);
+        let c = census(&body(convo(6, 20)), BETAS, false);
         assert_eq!(step(&mut s, &c, &cfg(4), true), None, "and stops advancing");
 
         let mut s = pinned.clone();
@@ -806,7 +866,7 @@ mod tests {
         assert_eq!(settle(&mut s, e, true, OPUS, Some(&usage(1000, ok)), 200), [CACHE_REGRESSED]);
         assert_eq!(settle(&mut s, e, true, OPUS, Some(&usage(1000, ok)), 200), [CACHE_REGRESSED]);
         assert_eq!((s.regressions, s.cleared), (2, 5));
-        let c = census(&body(convo(6, 4)), BETAS);
+        let c = census(&body(convo(6, 4)), BETAS, false);
         step(&mut s, &c, &cfg(4), false);
         assert_eq!(s.cleared, 5, "pinned until the cache is cold anyway");
         step(&mut s, &c, &cfg(4), true);
@@ -829,7 +889,7 @@ mod tests {
         let before = s.clone();
         assert!(settle(&mut s, e.unwrap(), true, OPUS, Some(&cut), 200).is_empty());
         assert_eq!(s, before, "neither breaker runs, and the previous prompt still counts");
-        let c = census(&body(convo(6, 20)), BETAS);
+        let c = census(&body(convo(6, 20)), BETAS, false);
         assert!(step(&mut s, &c, &cfg(4), true).is_some(), "the thread still advances");
     }
 
@@ -843,11 +903,11 @@ mod tests {
         let mut s = pinned.clone();
         s.last_prompt = 50_000;
         for _ in 0..2 {
-            let tripped = settle(&mut s, e, true, OPUS, Some(&usage(1000, Some((4, 7)))), 200);
+            let tripped = settle(&mut s, e, true, OPUS, Some(&usage(1000, Some((4, 1)))), 200);
             assert_eq!(tripped, [CTX_MISMATCH, CACHE_REGRESSED]);
         }
         assert_eq!((s.regressions, s.frozen.as_deref()), (2, Some(CTX_MISMATCH)));
-        let c = census(&body(convo(6, 5)), BETAS);
+        let c = census(&body(convo(6, 5)), BETAS, false);
         step(&mut s, &c, &cfg(4), true);
         assert_eq!(s.cleared, 0);
         assert_eq!(apply(&mut body(convo(6, 5)), &c, &s), None, "the client's own setting");
@@ -859,13 +919,13 @@ mod tests {
         let e = e.unwrap();
         let mut s = pinned.clone();
         let sonnet = Some("claude-sonnet-5-5");
-        assert!(settle(&mut s, e, false, OPUS, Some(&usage(50_000, Some((5, 7)))), 200).is_empty());
+        assert!(settle(&mut s, e, false, OPUS, Some(&usage(50_000, Some((5, 1)))), 200).is_empty());
         // The other model has nothing of this thread cached, and switching
         // back may find the first one's expired: neither is a regression.
-        assert!(settle(&mut s, e, true, sonnet, Some(&usage(0, Some((5, 7)))), 200).is_empty());
-        assert!(settle(&mut s, e, true, OPUS, Some(&usage(0, Some((5, 7)))), 200).is_empty());
+        assert!(settle(&mut s, e, true, sonnet, Some(&usage(0, Some((5, 1)))), 200).is_empty());
+        assert!(settle(&mut s, e, true, OPUS, Some(&usage(0, Some((5, 1)))), 200).is_empty());
         assert_eq!((s.regressions, s.frozen.as_deref(), s.model.as_deref()), (0, None, OPUS));
-        assert_eq!(settle(&mut s, e, true, OPUS, Some(&usage(1000, Some((5, 7)))), 200), [CACHE_REGRESSED]);
+        assert_eq!(settle(&mut s, e, true, OPUS, Some(&usage(1000, Some((5, 1)))), 200), [CACHE_REGRESSED]);
     }
 
     #[test]
