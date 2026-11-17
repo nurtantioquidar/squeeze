@@ -271,6 +271,13 @@ struct ReplayArgs {
     /// Print JSON instead of a table
     #[arg(long)]
     json: bool,
+    /// Print each transcript's requests as Claude Code sent them, rebuilt from its request
+    /// log, one JSON line each ({at, betas, body}), on the recorded timeline
+    #[arg(long, hide = true, conflicts_with = "cache_sim")]
+    dump_requests: bool,
+    /// With --dump-requests: each as the summarizing request compaction would send for it
+    #[arg(long, hide = true, requires = "dump_requests")]
+    as_summary: bool,
     /// Try a different log line limit (default 250)
     #[arg(long)]
     max_lines: Option<usize>,
@@ -831,6 +838,15 @@ fn cmd_replay(a: ReplayArgs) -> Result<()> {
     }
     if a.cache_sim {
         return cmd_cache_sim(&a, &files);
+    }
+    if a.dump_requests {
+        for f in &files {
+            for r in cachesim::rebuild(f, Regime::OneHour)?.unwrap_or_default() {
+                let body = if a.as_summary { squeeze::compact::summary_request(&r.body) } else { Some(r.body) };
+                println!("{}", json!({ "at": r.at, "betas": r.betas, "body": body }));
+            }
+        }
+        return Ok(());
     }
     let mut cfg = TransformConfig { expand_hint: ExpandHint::Mcp, ..Default::default() };
     if let Some(n) = a.max_lines {

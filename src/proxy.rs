@@ -207,12 +207,15 @@ async fn handle(State(inner): State<Arc<Inner>>, req: Request) -> Response {
 
     let mut out = bytes.clone();
     let mut pending = None;
+    // The body asks for compaction's thinking-binding control, which needs its beta.
+    let mut binding = false;
     if (is_messages || is_count) && !parts.headers.contains_key(header::CONTENT_ENCODING) {
-        let (rewritten, p) = prepare(&inner, &parts.headers, &bytes, is_messages);
+        let (rewritten, p, bind) = prepare(&inner, &parts.headers, &bytes, is_messages);
         if let Some(b) = rewritten {
             out = b;
         }
         pending = p;
+        binding = bind;
     }
 
     if is_messages && let Some(dir) = std::env::var_os("SQUEEZE_DUMP_REQUESTS") {
@@ -229,7 +232,7 @@ async fn handle(State(inner): State<Arc<Inner>>, req: Request) -> Response {
     let upstream = inner
         .client
         .request(parts.method.clone(), &url)
-        .headers(forward_headers(&parts.headers))
+        .headers(with_binding_beta(forward_headers(&parts.headers), binding))
         .body(out)
         .send()
         .await;
@@ -323,9 +326,9 @@ fn prepare(
     headers: &HeaderMap,
     bytes: &Bytes,
     is_messages: bool,
-) -> (Option<Bytes>, Option<Pending>) {
+) -> (Option<Bytes>, Option<Pending>, bool) {
     let Ok(mut body) = serde_json::from_slice::<Value>(bytes) else {
-        return (None, None);
+        return (None, None, false);
     };
     let session = header_str(headers, "x-claude-code-session-id");
     let model = body.get("model").and_then(Value::as_str).map(str::to_string);
@@ -333,7 +336,7 @@ fn prepare(
 
     let mut stats = TransformStats::default();
     let mut rewritten = None;
-    let (mut thread, mut stamp, mut ctx, mut job) = (None, None, None, None);
+    let (mut thread, mut stamp, mut ctx, mut job, mut binding) = (None, None, None, None, false);
     if inner.transform.is_some() || inner.ctx.is_some() || inner.compact.is_some() {
         let tracked =
             inner.ctx.is_some() || inner.compact.is_some() || inner.transform.as_ref().is_some_and(|c| c.prune.enabled);
@@ -341,9 +344,9 @@ fn prepare(
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let tick = tracked.then(|| thread_tick(inner, &body, headers, is_messages)).flatten();
             // The summary goes in first: everything after works on what's sent.
-            let (compacted, job) = match (&inner.compact, &tick) {
+            let (compacted, job, bound) = match (&inner.compact, &tick) {
                 (Some(_), Some(t)) => compact_step(inner, &mut body, t, is_messages),
-                _ => (false, None),
+                _ => (false, None, false),
             };
             let boundary = tick.as_ref().and_then(|t| t.boundary.clone());
             let s = inner
@@ -355,11 +358,12 @@ fn prepare(
                 (Some(cfg), Some(t)) => Some(ctx_step(inner, cfg, &mut body, headers, t, is_messages)),
                 _ => None,
             };
-            (tick, s, c, compacted, job)
+            (tick, s, c, compacted || bound, job, bound)
         }));
         match result {
-            Ok((tick, s, c, compacted, j)) => {
+            Ok((tick, s, c, compacted, j, bound)) => {
                 job = j;
+                binding = bound;
                 if let Some(t) = tick {
                     if t.cold {
                         tracing::info!(
@@ -383,7 +387,7 @@ fn prepare(
                         Err(e) => {
                             tracing::warn!("could not re-serialize the request, forwarding it unchanged: {e}");
                             ctx = c.map(|c| CtxRequest { expected: None, ..c });
-                            job = None;
+                            (job, binding) = (None, false);
                         }
                     }
                 } else {
@@ -405,12 +409,12 @@ fn prepare(
         ctx,
         compact: job,
     });
-    (rewritten, pending)
+    (rewritten, pending, binding)
 }
 
 /// Compaction for one request: put the thread's summary in, and note what
 /// summarizing this request's conversation would need, should it end a turn.
-fn compact_step(inner: &Inner, body: &mut Value, tick: &Tick, is_messages: bool) -> (bool, Option<CompactJob>) {
+fn compact_step(inner: &Inner, body: &mut Value, tick: &Tick, is_messages: bool) -> (bool, Option<CompactJob>, bool) {
     let job = match (is_messages, tick.generation, body.get("messages").and_then(Value::as_array)) {
         (true, Some(generation), Some(m)) => Some(CompactJob {
             generation,
@@ -422,13 +426,14 @@ fn compact_step(inner: &Inner, body: &mut Value, tick: &Tick, is_messages: bool)
         _ => None,
     };
     let mut threads = lock(&inner.threads);
-    let Some(state) = threads.get_mut(&tick.key) else { return (false, job) };
+    let Some(state) = threads.get_mut(&tick.key) else { return (false, job, false) };
     let before = state.compact.clone();
     let changed = compact::apply(body, &mut state.compact, is_messages);
+    let bound = compact::guard(body, &state.compact);
     if state.compact != before {
         inner.store.save_thread(&tick.key, state);
     }
-    (changed, job)
+    (changed, job, bound)
 }
 
 /// Context editing for one request: census its history, advance the thread's
@@ -753,7 +758,7 @@ async fn compact_later(
     let Some(request) = compact::summary_request(&body) else { return };
     let Ok(payload) = serde_json::to_vec(&request) else { return };
     let sent = credentials
-        .apply(inner.client.post(format!("{}/v1/messages", inner.upstream)))
+        .apply(inner.client.post(format!("{}/v1/messages", inner.upstream)), &[compact::THINKING_BINDING_BETA])
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::USER_AGENT, concat!("squeeze/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(600))
@@ -868,6 +873,28 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+/// Add [`compact::THINKING_BINDING_BETA`] to `anthropic-beta` when `add`.
+fn with_binding_beta(mut h: HeaderMap, add: bool) -> HeaderMap {
+    if !add {
+        return h;
+    }
+    let mut betas: Vec<String> = h
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+        .collect();
+    if !betas.iter().any(|b| b == compact::THINKING_BINDING_BETA) {
+        betas.push(compact::THINKING_BINDING_BETA.into());
+    }
+    if let Ok(v) = HeaderValue::from_str(&betas.join(",")) {
+        h.insert("anthropic-beta", v);
+    }
+    h
 }
 
 fn forward_headers(src: &HeaderMap) -> HeaderMap {

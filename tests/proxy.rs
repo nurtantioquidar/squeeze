@@ -1009,3 +1009,29 @@ async fn a_request_before_the_pause_ends_cancels_the_summary() {
         assert_eq!(s.json()["messages"].as_array().unwrap().len(), next["messages"].as_array().unwrap().len());
     }
 }
+
+#[tokio::test]
+async fn a_summary_that_stops_fitting_leaves_thinking_dropped_not_refused() {
+    let (clock, dir) = (Arc::new(FakeClock::default()), tempfile::tempdir().unwrap());
+    let (mock, url) = compact_proxy(&clock, dir.path()).await;
+    cm_send(&url, &mock, &clock, T0, MESSAGES, &cm_conversation(6, 2)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+    let up = cm_send(&url, &mock, &clock, T0 + 400, MESSAGES, &after_the_pause()).await;
+    assert_eq!(up.json()["messages"].as_array().unwrap().len(), 3, "the summary is in use");
+    assert!(!up.headers.get("anthropic-beta").unwrap().to_str().unwrap().contains("thinking-binding"));
+
+    // Claude Code rewrote its history: the summary no longer fits, and the
+    // thinking made after it would be refused without the binding control.
+    let mut rewound = after_the_pause();
+    rewound["messages"][2]["content"][0]["content"] = json!("rewritten");
+    for at in [T0 + 410, T0 + 420] {
+        let up = cm_send(&url, &mock, &clock, at, MESSAGES, &rewound).await;
+        let body = up.json();
+        assert_eq!(body["messages"], rewound["messages"], "sent as Claude Code sent it");
+        assert_eq!(body["thinking"]["block_binding"]["prefix_mismatch_behavior"], "drop_block");
+        let betas = up.headers.get("anthropic-beta").unwrap().to_str().unwrap().to_string();
+        assert!(
+            betas.contains("thinking-binding-controls-2026-08-01") && betas.contains("context-management-2025-06-27")
+        );
+    }
+}

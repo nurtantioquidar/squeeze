@@ -50,6 +50,17 @@ const SUMMARY_MAX_TOKENS: u64 = 16_000;
 const MIN_SUMMARY_CHARS: usize = 200;
 /// Claude Code's own beta, which squeeze's requests leave out.
 pub const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
+/// The API's thinking-binding controls. A thinking block is bound to the
+/// conversation before it, so the summarizing request, which cuts earlier
+/// content to excerpts ([`skeleton`]), asks for mismatched blocks to be
+/// dropped (`prefix_mismatch_behavior: drop_block`) instead of refused.
+pub const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+/// The newest tool results and tool inputs that go to the summarizer whole;
+/// older ones longer than [`SKELETON_MIN_CHARS`] go as excerpts.
+const SKELETON_KEEP_RECENT: usize = 6;
+const SKELETON_MIN_CHARS: usize = 1_500;
+const SKELETON_HEAD_CHARS: usize = 600;
+const SKELETON_TAIL_CHARS: usize = 300;
 
 /// What the summarizing request asks for, appended to the conversation.
 pub const INSTRUCTION: &str = "Stop working on the task for a moment. Your context is about to be compacted: \
@@ -83,6 +94,11 @@ pub struct CompactState {
     pub pending: Option<Summary>,
     /// Summaries made in this thread.
     pub compactions: u64,
+    /// A summary in use stopped fitting the conversation (Claude Code rewound
+    /// or compacted it): the history may hold thinking made after the summary,
+    /// bound to it, so from then on requests ask the API to drop thinking
+    /// whose conversation changed instead of refusing it ([`guard`]).
+    pub guard: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -162,11 +178,24 @@ pub fn apply(body: &mut Value, state: &mut CompactState, update: bool) -> bool {
         Some(_) => {
             if update {
                 state.active = None;
+                state.guard = true;
             }
             false
         }
         None => false,
     }
+}
+
+/// For a thread with [`CompactState::guard`] set: ask the API to drop thinking
+/// whose conversation changed (needs [`THINKING_BINDING_BETA`]). Returns
+/// whether the body changed.
+pub fn guard(body: &mut Value, state: &CompactState) -> bool {
+    if !state.guard {
+        return false;
+    }
+    let Some(t) = body.get_mut("thinking").and_then(Value::as_object_mut) else { return false };
+    t.insert("block_binding".into(), json!({ "prefix_mismatch_behavior": "drop_block" }));
+    true
 }
 
 /// `messages[1..covered]` out but for their `system`-role messages, the
@@ -194,9 +223,73 @@ fn substitute(body: &mut Value, covered: usize, summary: &str) {
     *messages = std::iter::once(first).chain(system).chain([reply]).chain(rest).collect();
 }
 
+/// The first and last characters of a long text, with a note of what's left out.
+fn excerpt(s: &str) -> Option<String> {
+    let n = s.chars().count();
+    if n <= SKELETON_MIN_CHARS {
+        return None;
+    }
+    let head: String = s.chars().take(SKELETON_HEAD_CHARS).collect();
+    let tail: String = s.chars().skip(n - SKELETON_TAIL_CHARS).collect();
+    let left_out = n - SKELETON_HEAD_CHARS - SKELETON_TAIL_CHARS;
+    Some(format!("{head}\n[... {left_out} characters left out of the summary's input ...]\n{tail}"))
+}
+
+/// What the summarizer reads: the conversation with older tool output and
+/// large tool inputs (whole files written, long edits) cut to excerpts. The
+/// summary is asked to leave these out anyway, and they are most of the
+/// tokens it would otherwise read at full price.
+fn skeleton(messages: &mut [Value]) {
+    let (mut results, mut uses) = (Vec::new(), Vec::new());
+    for (i, m) in messages.iter().enumerate() {
+        for (j, b) in m.get("content").and_then(Value::as_array).into_iter().flatten().enumerate() {
+            match b.get("type").and_then(Value::as_str) {
+                Some("tool_result") => results.push((i, j)),
+                Some("tool_use") => uses.push((i, j)),
+                _ => {}
+            }
+        }
+    }
+    let cut = |s: &mut String| {
+        if let Some(e) = excerpt(s) {
+            *s = e;
+        }
+    };
+    for &(i, j) in &results[..results.len().saturating_sub(SKELETON_KEEP_RECENT)] {
+        match messages[i]["content"][j].get_mut("content") {
+            Some(Value::String(s)) => cut(s),
+            Some(Value::Array(items)) => {
+                for it in items.iter_mut() {
+                    match it.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(Value::String(s)) = it.get_mut("text") {
+                                cut(s);
+                            }
+                        }
+                        Some(_) => *it = json!({ "type": "text", "text": "[left out of the summary's input]" }),
+                        None => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for &(i, j) in &uses[..uses.len().saturating_sub(SKELETON_KEEP_RECENT)] {
+        if let Some(input) = messages[i]["content"][j].get_mut("input").and_then(Value::as_object_mut) {
+            for v in input.values_mut() {
+                if let Value::String(s) = v {
+                    cut(s);
+                }
+            }
+        }
+    }
+}
+
 /// The summarizing request: the request that ended the turn, as forwarded,
-/// with the instruction appended to its last message, no cache markers on the
-/// messages (the system prompt's stay), low effort, and no streaming.
+/// with older tool output cut to excerpts ([`skeleton`]), the instruction
+/// appended to its last message, no cache markers on the messages (the system
+/// prompt's stay), mismatched thinking dropped rather than refused, low
+/// effort, and no streaming. It needs [`THINKING_BINDING_BETA`].
 pub fn summary_request(forwarded: &Value) -> Option<Value> {
     let mut b = forwarded.clone();
     let messages = b.get_mut("messages")?.as_array_mut()?;
@@ -207,6 +300,7 @@ pub fn summary_request(forwarded: &Value) -> Option<Value> {
             }
         }
     }
+    skeleton(messages);
     let instruction = json!({ "type": "text", "text": INSTRUCTION });
     let last = messages.last_mut()?;
     if role(last) == Some("user") {
@@ -220,6 +314,9 @@ pub fn summary_request(forwarded: &Value) -> Option<Value> {
     }
     b["stream"] = json!(false);
     b["max_tokens"] = json!(SUMMARY_MAX_TOKENS);
+    if let Some(t) = b.get_mut("thinking").and_then(Value::as_object_mut) {
+        t.insert("block_binding".into(), json!({ "prefix_mismatch_behavior": "drop_block" }));
+    }
     if let Some(oc) = b.get_mut("output_config").and_then(Value::as_object_mut) {
         oc.insert("effort".into(), json!("low"));
     }
@@ -279,14 +376,15 @@ impl Credentials {
         Some(Self { api_key: key, version: header("anthropic-version"), betas: betas.filter(|b| !b.is_empty()) })
     }
 
-    pub fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let mut req = req
+    /// The request authenticated, with the client's betas (but Claude Code's)
+    /// and `extra` ones.
+    pub fn apply(&self, req: reqwest::RequestBuilder, extra: &[&str]) -> reqwest::RequestBuilder {
+        let req = req
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", self.version.as_deref().unwrap_or("2023-06-01"));
-        if let Some(b) = &self.betas {
-            req = req.header("anthropic-beta", b);
-        }
-        req
+        let betas: Vec<&str> =
+            self.betas.as_deref().into_iter().flat_map(|b| b.split(',')).chain(extra.iter().copied()).collect();
+        if betas.is_empty() { req } else { req.header("anthropic-beta", betas.join(",")) }
     }
 }
 
@@ -393,19 +491,24 @@ mod tests {
             active: Some(summary()),
             pending: Some(Summary { covered: 9, ..summary() }),
             compactions: 2,
+            guard: false,
         };
         let mut body = json!({ "messages": later.clone() });
         assert!(apply(&mut body, &mut st, true));
         assert_eq!((st.active.is_some(), st.pending.is_none()), (true, true));
         assert_eq!(body["messages"].as_array().unwrap().len(), 7);
 
-        // A history that no longer continues the summarized one drops even an active summary.
+        // A history that no longer continues the summarized one drops even an
+        // active summary, and from then on mismatched thinking is dropped, not refused.
         let mut st = CompactState { active: Some(summary()), ..Default::default() };
         let mut other = convo(true);
         other[3]["content"][0]["content"] = json!("rewritten");
-        let mut body = json!({ "messages": other });
+        let mut body = json!({ "thinking": { "type": "adaptive" }, "messages": other });
         assert!(!apply(&mut body, &mut st, true));
-        assert_eq!(st.active, None);
+        assert_eq!((st.active.clone(), st.guard), (None, true));
+        assert!(guard(&mut body, &st));
+        assert_eq!(body["thinking"]["block_binding"]["prefix_mismatch_behavior"], "drop_block");
+        assert!(!guard(&mut json!({ "thinking": { "type": "adaptive" } }), &CompactState::default()));
 
         // count_tokens previews it without changing the state.
         let mut st = pending();
@@ -431,6 +534,30 @@ mod tests {
         let last = r["messages"].as_array().unwrap().last().unwrap();
         assert_eq!(last["content"][1]["text"], INSTRUCTION, "appended to the last user message");
         assert_eq!(r["messages"].as_array().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn the_summarizer_reads_older_tool_output_as_excerpts() {
+        let mut messages = vec![user("go")];
+        for i in 0..8 {
+            messages.push(json!({ "role": "assistant", "content": [
+                { "type": "tool_use", "id": format!("t{i}"), "name": "Write",
+                  "input": { "file_path": format!("f{i}"), "content": "w".repeat(3000) } }
+            ] }));
+            messages.push(json!({ "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": format!("t{i}"), "content": "r".repeat(5000) }
+            ] }));
+        }
+        let r = summary_request(&json!({ "thinking": { "type": "adaptive" }, "messages": messages })).unwrap();
+        let m = r["messages"].as_array().unwrap();
+        let len = |v: &Value| v.as_str().unwrap().chars().count();
+        // The two oldest of eight are cut, the newest six whole.
+        assert!(len(&m[2]["content"][0]["content"]) < 1000 && len(&m[1]["content"][0]["input"]["content"]) < 1000);
+        assert!(m[2]["content"][0]["content"].as_str().unwrap().contains("4100 characters left out"));
+        assert_eq!(len(&m[6]["content"][0]["content"]), 5000);
+        assert_eq!(len(&m[5]["content"][0]["input"]["content"]), 3000);
+        assert_eq!(m[5]["content"][0]["input"]["file_path"], "f2", "short fields whole");
+        assert_eq!(r["thinking"]["block_binding"]["prefix_mismatch_behavior"], "drop_block");
     }
 
     #[test]
