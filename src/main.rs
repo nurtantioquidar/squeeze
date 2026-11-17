@@ -100,8 +100,11 @@ struct CompressFlags {
     /// With --context-edits: clear tool inputs (the agent's older Edit and Write text) too
     #[arg(long)]
     clear_tool_inputs: bool,
-    /// With --context-edits: also clear thinking from before the latest human prompt
-    #[arg(long, value_name = "BOOL", default_value_t = true, action = clap::ArgAction::Set)]
+    /// With --context-edits: also clear thinking from before the latest human prompt.
+    /// Off by default: Claude Code sends old thinking without its text (about 30-50
+    /// tokens a turn), and the API counts a thinking turn at every reminder Claude Code
+    /// adds, which the proxy can't always see, so a pinned count can cost cache misses
+    #[arg(long, value_name = "BOOL", default_value_t = false, action = clap::ArgAction::Set)]
     clear_thinking: bool,
     /// Upstream API base URL [default: $ANTHROPIC_BASE_URL, else https://api.anthropic.com]
     #[arg(long)]
@@ -1570,12 +1573,12 @@ mod tests {
     fn proxied_arms_get_their_flags() {
         let cm = CompressFlags::for_arm(Arm::SqueezeProxyCm, Some("http://u".into())).unwrap();
         let ctx = cm.ctx().unwrap().expect("context editing on");
-        assert_eq!((ctx.window, ctx.clear_inputs, ctx.clear_thinking), (KeepWindow::default(), false, true));
+        assert_eq!((ctx.window, ctx.clear_inputs, ctx.clear_thinking), (KeepWindow::default(), false, false));
         let t = cm.transform(ExpandHint::Mcp).unwrap().unwrap();
         assert_eq!((t.ctx_window, t.prune.enabled), (Some(ctx.window), false));
         assert_eq!(cm.upstream(), "http://u");
         let inputs = CompressFlags::for_arm(Arm::SqueezeProxyCmInputs, None).unwrap().ctx().unwrap().unwrap();
-        assert_eq!((inputs.window, inputs.clear_inputs, inputs.clear_thinking), (KeepWindow::default(), true, true));
+        assert_eq!((inputs.window, inputs.clear_inputs, inputs.clear_thinking), (KeepWindow::default(), true, false));
         let plain = CompressFlags::for_arm(Arm::SqueezeProxy, None).unwrap();
         assert_eq!(plain.ctx().unwrap(), None);
         assert_eq!(plain.transform(ExpandHint::Mcp).unwrap().unwrap().ctx_window, None);
