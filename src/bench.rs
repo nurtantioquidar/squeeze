@@ -139,6 +139,9 @@ pub enum Arm {
     /// API key only): the proxy summarizes the conversation in the background
     /// before the cache expires, and sends the summary in its place.
     SqueezeProxyCompact,
+    /// squeeze-proxy-compact with summaries read from Claude Code's cache
+    /// (`--compact-warm`: its requests go out without the claude-code beta).
+    SqueezeProxyCompactWarm,
     /// Hook compression + MCP tools that replace Claude Code's file tools
     /// (Read/Edit/Write/Grep/Glob turned off), working guidance, and unused
     /// built-in tools trimmed (`squeeze run --replace-file-tools --trim-tools`).
@@ -171,6 +174,7 @@ impl Arm {
             Arm::SqueezeProxyCm => "squeeze-proxy-cm",
             Arm::SqueezeProxyCmInputs => "squeeze-proxy-cm-inputs",
             Arm::SqueezeProxyCompact => "squeeze-proxy-compact",
+            Arm::SqueezeProxyCompactWarm => "squeeze-proxy-compact-warm",
             Arm::SqueezeFull => "squeeze-full",
             Arm::SqueezeScout => "squeeze-scout",
             Arm::SqueezeCompact => "squeeze-compact",
@@ -186,6 +190,7 @@ impl Arm {
                 | Arm::SqueezeProxyCm
                 | Arm::SqueezeProxyCmInputs
                 | Arm::SqueezeProxyCompact
+                | Arm::SqueezeProxyCompactWarm
                 | Arm::SqueezeFull
                 | Arm::SqueezeScout
                 | Arm::SqueezeCompact
@@ -199,6 +204,7 @@ impl Arm {
             Arm::SqueezeProxyCm => Some(&["--context-edits", "cold"]),
             Arm::SqueezeProxyCmInputs => Some(&["--context-edits", "cold", "--clear-tool-inputs"]),
             Arm::SqueezeProxyCompact => Some(&["--compact-pauses"]),
+            Arm::SqueezeProxyCompactWarm => Some(&["--compact-pauses", "--compact-warm"]),
             _ => None,
         }
     }
@@ -288,13 +294,14 @@ impl std::str::FromStr for Arm {
             "squeeze-proxy-cm" => Arm::SqueezeProxyCm,
             "squeeze-proxy-cm-inputs" => Arm::SqueezeProxyCmInputs,
             "squeeze-proxy-compact" => Arm::SqueezeProxyCompact,
+            "squeeze-proxy-compact-warm" => Arm::SqueezeProxyCompactWarm,
             "squeeze-full" => Arm::SqueezeFull,
             "squeeze-scout" => Arm::SqueezeScout,
             "squeeze-compact" => Arm::SqueezeCompact,
             "squeeze-max" => Arm::SqueezeMax,
             other => {
                 bail!(
-                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-compact, squeeze-max, squeeze-hook, squeeze-mcp, squeeze-proxy, squeeze-proxy-cm, squeeze-proxy-cm-inputs, squeeze-proxy-compact)"
+                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-compact, squeeze-max, squeeze-hook, squeeze-mcp, squeeze-proxy, squeeze-proxy-cm, squeeze-proxy-cm-inputs, squeeze-proxy-compact, squeeze-proxy-compact-warm)"
                 )
             }
         })
@@ -1323,7 +1330,7 @@ mod tests {
 
     #[test]
     fn arms_that_replace_file_tools_serve_squeeze_tools() {
-        let names = "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-max,squeeze-hook,squeeze-mcp,squeeze-proxy,squeeze-proxy-cm,squeeze-proxy-cm-inputs,squeeze-proxy-compact";
+        let names = "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-max,squeeze-hook,squeeze-mcp,squeeze-proxy,squeeze-proxy-cm,squeeze-proxy-cm-inputs,squeeze-proxy-compact,squeeze-proxy-compact-warm";
         for name in names.split(',') {
             let arm: Arm = name.parse().unwrap();
             assert_eq!(arm.name(), name);

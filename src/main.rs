@@ -112,6 +112,12 @@ struct CompressFlags {
     /// before the cache expires (for testing)
     #[arg(long, hide = true, requires = "compact_pauses")]
     compact_idle_secs: Option<u64>,
+    /// With --compact-pauses: forward Claude Code's requests without its
+    /// claude-code-20250219 beta, so the summarizing request (the turn's last request plus
+    /// the instruction) reads the conversation from the prompt cache instead of paying full
+    /// input price for it
+    #[arg(long, requires = "compact_pauses")]
+    compact_warm: bool,
     /// With --context-edits: also clear thinking from before the latest human prompt.
     /// Off by default: Claude Code sends old thinking without its text (about 30-50
     /// tokens a turn), and the API counts a thinking turn at every reminder Claude Code
@@ -171,7 +177,11 @@ impl CompressFlags {
         if self.context_edits != ContextEdits::Off {
             bail!("--compact-pauses and --context-edits cold don't go together");
         }
-        Ok(Some(squeeze::compact::CompactConfig { idle_secs: self.compact_idle_secs, ..Default::default() }))
+        Ok(Some(squeeze::compact::CompactConfig {
+            idle_secs: self.compact_idle_secs,
+            warm: self.compact_warm,
+            ..Default::default()
+        }))
     }
 
     fn proxy_config(&self, hint: ExpandHint, store: Store) -> Result<ProxyConfig> {
@@ -278,6 +288,9 @@ struct ReplayArgs {
     /// With --dump-requests: each as the summarizing request compaction would send for it
     #[arg(long, hide = true, requires = "dump_requests")]
     as_summary: bool,
+    /// With --as-summary: the --compact-warm form (the request plus the instruction)
+    #[arg(long, hide = true, requires = "as_summary")]
+    warm: bool,
     /// With --dump-requests: each as the compaction proxy would forward it, with a placeholder
     /// summary made after each of these requests (0-based, in the first transcript's order)
     #[arg(long, hide = true, requires = "dump_requests", value_delimiter = ',')]
@@ -861,7 +874,11 @@ fn cmd_replay(a: ReplayArgs) -> Result<()> {
                         });
                     }
                 }
-                let body = if a.as_summary { compact::summary_request(&body) } else { Some(body) };
+                let body = match (a.as_summary, a.warm) {
+                    (true, true) => compact::warm_summary_request(&body),
+                    (true, false) => compact::summary_request(&body),
+                    _ => Some(body),
+                };
                 println!("{}", json!({ "at": r.at, "betas": r.betas, "body": body }));
             }
         }

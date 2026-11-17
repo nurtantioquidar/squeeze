@@ -17,6 +17,14 @@
 //! reads the system prompt and tools from the cache and the conversation as
 //! uncached input; it puts no cache markers on the conversation, which would
 //! only add cache writes nobody reads.
+//!
+//! With `--compact-warm` the proxy instead takes that beta out of the requests
+//! it forwards for Claude Code (it removes Claude Code's own marker; it never
+//! adds it to a request of its own), so Claude Code's cache entries are the
+//! ones any client with the key reads. The summarizing request is then the
+//! forwarded request itself with the instruction added at its end: same
+//! system prompt, tools, messages, cache markers, thinking settings and betas,
+//! so it reads the whole conversation from the cache ([`warm_summary_request`]).
 
 use crate::auth;
 use crate::util::short_hash;
@@ -33,11 +41,14 @@ pub struct CompactConfig {
     /// Summarize only a conversation (messages, not the system prompt and
     /// tools) of at least about this many tokens.
     pub min_tokens: u64,
+    /// `--compact-warm`: forward Claude Code's requests without its beta and
+    /// summarize from the cache ([`warm_summary_request`]).
+    pub warm: bool,
 }
 
 impl Default for CompactConfig {
     fn default() -> Self {
-        Self { idle_secs: None, min_tokens: 20_000 }
+        Self { idle_secs: None, min_tokens: 20_000, warm: false }
     }
 }
 
@@ -359,6 +370,39 @@ pub fn summary_request(forwarded: &Value) -> Option<Value> {
     Some(b)
 }
 
+/// The summarizing request for `--compact-warm`: the request that ended the
+/// turn exactly as forwarded, with the instruction added to its last message
+/// (a user message, or the `system`-role note Claude Code may end with; a
+/// user message would not be allowed after that note) and no streaming.
+/// Nothing that keys the prompt cache changes, so the conversation up to the
+/// last cache marker is read from the cache Claude Code's request left.
+pub fn warm_summary_request(forwarded: &Value) -> Option<Value> {
+    let mut b = forwarded.clone();
+    let messages = b.get_mut("messages")?.as_array_mut()?;
+    let instruction = json!({ "type": "text", "text": INSTRUCTION });
+    let last = messages.last_mut()?;
+    if matches!(role(last), Some("user" | "system")) {
+        match last.get_mut("content") {
+            Some(Value::Array(blocks)) => blocks.push(instruction),
+            Some(Value::String(t)) => last["content"] = json!([{ "type": "text", "text": t.clone() }, instruction]),
+            _ => return None,
+        }
+    } else {
+        messages.push(json!({ "role": "user", "content": [instruction] }));
+    }
+    b["stream"] = json!(false);
+    b["max_tokens"] = json!(SUMMARY_MAX_TOKENS);
+    Some(b)
+}
+
+/// An `anthropic-beta` value without Claude Code's beta, normalized the way
+/// [`Credentials`] keeps it (trimmed, comma-joined); `None` if nothing is left.
+pub fn without_claude_code_beta(value: &str) -> Option<String> {
+    let betas: Vec<&str> =
+        value.split(',').map(str::trim).filter(|b| !b.is_empty() && *b != CLAUDE_CODE_BETA).collect();
+    (!betas.is_empty()).then(|| betas.join(","))
+}
+
 /// The summary in a non-streaming response, if it finished and says enough.
 pub fn summary_text(response: &Value) -> Option<String> {
     if response.get("stop_reason").and_then(Value::as_str) != Some("end_turn") {
@@ -402,14 +446,9 @@ impl Credentials {
             return None;
         }
         let header = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
-        let betas = header("anthropic-beta").map(|b| {
-            b.split(',')
-                .map(str::trim)
-                .filter(|b| !b.is_empty() && *b != CLAUDE_CODE_BETA)
-                .collect::<Vec<_>>()
-                .join(",")
-        });
-        Some(Self { api_key: key, version: header("anthropic-version"), betas: betas.filter(|b| !b.is_empty()) })
+        let all: Vec<&str> = h.get_all("anthropic-beta").iter().filter_map(|v| v.to_str().ok()).collect();
+        let betas = without_claude_code_beta(&all.join(","));
+        Some(Self { api_key: key, version: header("anthropic-version"), betas })
     }
 
     /// The request authenticated, with the client's betas (but Claude Code's)
@@ -651,6 +690,46 @@ mod tests {
         let mut st = pending();
         assert!(apply(&mut body, &mut st, true));
         assert_eq!(body["messages"].as_array().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn the_warm_summarizing_request_changes_nothing_that_keys_the_cache() {
+        let mut messages = convo(false);
+        messages[8]["content"][0]["cache_control"] = json!({ "type": "ephemeral" });
+        let forwarded = json!({
+            "model": "claude-opus-5-5", "stream": true, "max_tokens": 32000,
+            "thinking": { "type": "adaptive", "display": "omitted" }, "output_config": { "effort": "medium" },
+            "system": [{ "type": "text", "text": "sys", "cache_control": { "type": "ephemeral" } }],
+            "messages": messages
+        });
+        let r = warm_summary_request(&forwarded).unwrap();
+        let mut expect = forwarded.clone();
+        expect["messages"][8]["content"].as_array_mut().unwrap().push(json!({ "type": "text", "text": INSTRUCTION }));
+        expect["stream"] = json!(false);
+        expect["max_tokens"] = json!(SUMMARY_MAX_TOKENS);
+        assert_eq!(r, expect);
+
+        // A request that ends with Claude Code's system note gets the
+        // instruction in that note: a user message may not follow it.
+        let mut messages = convo(false);
+        messages.push(system("# Environment update"));
+        let r = warm_summary_request(&json!({ "messages": messages })).unwrap();
+        let m = r["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 10);
+        assert_eq!(
+            m[9]["content"],
+            json!([{ "type": "text", "text": "# Environment update" }, { "type": "text", "text": INSTRUCTION }])
+        );
+    }
+
+    #[test]
+    fn claude_codes_beta_comes_out_normalized() {
+        assert_eq!(
+            without_claude_code_beta("claude-code-20250219, context-management-2025-06-27,effort-2025-11-24")
+                .as_deref(),
+            Some("context-management-2025-06-27,effort-2025-11-24")
+        );
+        assert_eq!(without_claude_code_beta("claude-code-20250219"), None);
     }
 
     #[test]

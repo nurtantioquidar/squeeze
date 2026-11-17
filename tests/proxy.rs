@@ -893,6 +893,10 @@ async fn a_refill_is_counted_as_a_cost() {
 /// in front of a mock that answers every turn with `end_turn` on a large
 /// prompt, and a summarizing request with a summary.
 async fn compact_proxy(clock: &Arc<FakeClock>, store_dir: &Path) -> (common::Mock, String) {
+    compact_proxy_with(clock, store_dir, false).await
+}
+
+async fn compact_proxy_with(clock: &Arc<FakeClock>, store_dir: &Path, warm: bool) -> (common::Mock, String) {
     let mock = common::start(Arc::new(|r: &common::Recorded| {
         let body = r.json();
         if body["stream"] == false {
@@ -909,7 +913,7 @@ async fn compact_proxy(clock: &Arc<FakeClock>, store_dir: &Path) -> (common::Moc
         Reply::Sse(common::sse_text_with(0, "Done.", usage, json!({})))
     }))
     .await;
-    let compact = squeeze::compact::CompactConfig { idle_secs: Some(1), min_tokens: 5_000 };
+    let compact = squeeze::compact::CompactConfig { idle_secs: Some(1), min_tokens: 5_000, warm };
     let cfg = ProxyConfig {
         upstream: mock.url(),
         transform: Some(TransformConfig::default()),
@@ -992,6 +996,40 @@ async fn compaction_summarizes_at_a_pause_and_sends_the_summary_from_then_on() {
         (c[0]["compaction"]["stored"].clone(), c[0]["usage"]["output_tokens"].clone()),
         (json!(true), json!(700))
     );
+}
+
+#[tokio::test]
+async fn warm_compaction_forwards_without_claude_codes_beta_and_summarizes_from_the_cache() {
+    let (clock, dir) = (Arc::new(FakeClock::default()), tempfile::tempdir().unwrap());
+    let (mock, url) = compact_proxy_with(&clock, dir.path(), true).await;
+    let mut turn = cm_conversation(6, 2);
+    let n = turn["messages"].as_array().unwrap().len();
+    turn["messages"][n - 1]["content"][0]["cache_control"] = json!({ "type": "ephemeral" });
+    let sent = cm_send(&url, &mock, &clock, T0, MESSAGES, &turn).await;
+    let betas = |r: &common::Recorded| r.headers.get("anthropic-beta").unwrap().to_str().unwrap().to_string();
+    assert!(CM_BETAS.contains("claude-code-20250219"));
+    let forwarded = betas(&sent);
+    assert!(!forwarded.contains("claude-code-20250219") && forwarded.contains("context-management"));
+    assert_eq!(sent.json(), turn, "the body is untouched");
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+
+    // The summarizing request is the forwarded one plus the instruction, with
+    // the same betas and everything else that keys the cache unchanged.
+    let s = summarizing(&mock);
+    assert_eq!(s.len(), 1);
+    assert_eq!(betas(&s[0]), forwarded);
+    let body = s[0].json();
+    let mut expect = turn.clone();
+    let last = expect["messages"][n - 1]["content"].as_array_mut().unwrap();
+    last.push(json!({ "type": "text", "text": squeeze::compact::INSTRUCTION }));
+    expect["stream"] = json!(false);
+    expect["max_tokens"] = body["max_tokens"].clone();
+    assert_eq!(body, expect, "cache markers, thinking and effort as forwarded");
+
+    // The summary is used as before.
+    let up = cm_send(&url, &mock, &clock, T0 + 400, MESSAGES, &after_the_pause()).await;
+    assert_eq!(up.json()["messages"].as_array().unwrap().len(), 3);
+    assert!(!betas(&up).contains("claude-code-20250219"));
 }
 
 #[tokio::test]

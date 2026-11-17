@@ -227,12 +227,17 @@ async fn handle(State(inner): State<Arc<Inner>>, req: Request) -> Response {
     if let Some(job) = pending.as_mut().and_then(|p| p.compact.as_mut()) {
         job.forwarded = Some(out.clone());
         job.credentials = Credentials::from_headers(&parts.headers);
+        job.bound = binding;
+    }
+    let mut headers = forward_headers(&parts.headers);
+    if inner.compact.is_some_and(|c| c.warm) {
+        without_claude_code_beta(&mut headers);
     }
     let url = format!("{}{}", inner.upstream, path_and_query);
     let upstream = inner
         .client
         .request(parts.method.clone(), &url)
-        .headers(with_binding_beta(forward_headers(&parts.headers), binding))
+        .headers(with_binding_beta(headers, binding))
         .body(out)
         .send()
         .await;
@@ -303,6 +308,8 @@ struct CompactJob {
     /// The body as forwarded.
     forwarded: Option<Bytes>,
     credentials: Option<Credentials>,
+    /// It went out with [`compact::THINKING_BINDING_BETA`] added.
+    bound: bool,
 }
 
 /// What context editing did to a request.
@@ -422,6 +429,7 @@ fn compact_step(inner: &Inner, body: &mut Value, tick: &Tick, is_messages: bool)
             prefix_hash: compact::messages_hash(m),
             forwarded: None,
             credentials: None,
+            bound: false,
         }),
         _ => None,
     };
@@ -739,7 +747,7 @@ async fn compact_later(
     started: u64,
     job: CompactJob,
 ) {
-    let CompactJob { generation, covered, prefix_hash, forwarded, credentials } = job;
+    let CompactJob { generation, covered, prefix_hash, forwarded, credentials, bound } = job;
     let (Some(forwarded), Some(credentials)) = (forwarded, credentials) else { return };
     let Ok(body) = serde_json::from_slice::<Value>(&forwarded) else { return };
     let conversation = body.get("messages").map_or(0, |m| m.to_string().len());
@@ -755,10 +763,18 @@ async fn compact_later(
     if !current(&inner) {
         return;
     }
-    let Some(request) = compact::summary_request(&body) else { return };
+    // Warm: the forwarded request plus the instruction, with exactly its betas,
+    // so it reads the conversation from the cache. Otherwise a cheaper-to-read
+    // skeleton that needs the binding beta.
+    let (request, extra): (_, &[&str]) = if cfg.warm {
+        (compact::warm_summary_request(&body), if bound { &[compact::THINKING_BINDING_BETA] } else { &[] })
+    } else {
+        (compact::summary_request(&body), &[compact::THINKING_BINDING_BETA])
+    };
+    let Some(request) = request else { return };
     let Ok(payload) = serde_json::to_vec(&request) else { return };
     let sent = credentials
-        .apply(inner.client.post(format!("{}/v1/messages", inner.upstream)), &[compact::THINKING_BINDING_BETA])
+        .apply(inner.client.post(format!("{}/v1/messages", inner.upstream)), extra)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::USER_AGENT, concat!("squeeze/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(600))
@@ -902,6 +918,19 @@ fn with_binding_beta(mut h: HeaderMap, add: bool) -> HeaderMap {
         h.insert("anthropic-beta", v);
     }
     h
+}
+
+/// `--compact-warm`: take Claude Code's beta out of a forwarded request.
+fn without_claude_code_beta(h: &mut HeaderMap) {
+    let all: Vec<String> =
+        h.get_all("anthropic-beta").iter().filter_map(|v| v.to_str().ok()).map(String::from).collect();
+    if all.is_empty() {
+        return;
+    }
+    h.remove("anthropic-beta");
+    if let Some(v) = compact::without_claude_code_beta(&all.join(",")).and_then(|b| HeaderValue::from_str(&b).ok()) {
+        h.insert("anthropic-beta", v);
+    }
 }
 
 fn forward_headers(src: &HeaderMap) -> HeaderMap {
