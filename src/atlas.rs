@@ -27,6 +27,42 @@ use tokio::process::Command;
 const TOOLS_DIR: &str = "/opt/sqz";
 /// The host as seen from Apple `container`'s default network.
 pub const APPLE_HOST_ADDR: &str = "192.168.64.1";
+/// A small image for [`BridgeAnchor`].
+const ANCHOR_IMAGE: &str = "docker.io/library/alpine:3.20";
+
+/// Apple's runtime brings up the host side of its network ([`APPLE_HOST_ADDR`])
+/// only while some container runs. The proxied arms' proxies listen there from
+/// before the first task container starts, through the pauses between tickets,
+/// until the run ends, so an idle container holds the network up meanwhile.
+pub struct BridgeAnchor(String);
+
+impl BridgeAnchor {
+    pub async fn start() -> Result<Self> {
+        let name = format!("squeeze-bridge-{}", std::process::id());
+        let mut c = Command::new(Runtime::Apple.bin());
+        // Bounded, in case the run dies without stopping it.
+        c.args(["run", "-d", "--rm", "--name", &name, ANCHOR_IMAGE, "sleep", "172800"]);
+        run_ok(c, "starting a container to hold the container network up").await?;
+        let anchor = Self(name);
+        for _ in 0..60 {
+            if std::net::TcpListener::bind((APPLE_HOST_ADDR, 0)).is_ok() {
+                return Ok(anchor);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        bail!("the container network's host address {APPLE_HOST_ADDR} did not come up")
+    }
+}
+
+impl Drop for BridgeAnchor {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(Runtime::Apple.bin())
+            .args(["stop", &self.0])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
 const AGENT_CONFIG: &str = "/root/.sqz-claude";
 const AGENT_STORE: &str = "/root/.squeeze";
 const GRADE_TIMEOUT_SECS: u64 = 7200;

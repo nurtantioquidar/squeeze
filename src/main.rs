@@ -1249,6 +1249,10 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
     eprintln!(
         "Auth: {}. Unmodified Claude Code {} runs inside each task container; squeeze adds only a hook and MCP tools.",
         match auth {
+            _ if a.api_key_all_arms => {
+                "every agent on the API key in --api-key-env-file (billed; passed by path, never read); \
+                 simulated user and judge per --auth"
+            }
             bench::Auth::Subscription => "your subscription via the setup-token env file (passed by path, never read)",
             bench::Auth::ApiKey => "API key (billed)",
         },
@@ -1289,6 +1293,12 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
     // runtime reaches the host at the bridge address, so bind there, not to every
     // interface. The proxy refuses subscription credentials, as everywhere.
     let mut proxy_urls = BTreeMap::new();
+    // Held until the run ends: the proxies listen on the container network's host address.
+    let _bridge = if runtime == atlas::Runtime::Apple && a.arms.iter().any(|a| a.is_proxied()) {
+        Some(atlas::BridgeAnchor::start().await?)
+    } else {
+        None
+    };
     for arm in a.arms.iter().filter(|a| a.is_proxied()) {
         if runtime != atlas::Runtime::Apple {
             bail!("the {} arm needs --runtime container for now", arm.name());
