@@ -1032,7 +1032,9 @@ pub fn tests_score(verifier: &Path) -> Result<(f64, f64, u64)> {
     let denom = n("missing_to_pass") + n("missing_to_fail") + n("pass_to_fail");
     let frac =
         if denom > 0 { (n("missing_to_pass") as f64 / denom as f64 * 10_000.0).round() / 10_000.0 } else { binary };
-    Ok((frac, binary, ran))
+    // The comparison ran the ticket's relevant tests even when the baseline
+    // skipped everything or couldn't start (no jest yet): that isn't vacuous.
+    Ok((frac, binary, ran.max(denom)))
 }
 
 fn rubric_status(reply: &Value, index: usize) -> Option<String> {
@@ -1264,6 +1266,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tests_score(dir.path()).unwrap(), (1.0, 1.0, 0), "falls back to binary; 0 ran = vacuous");
+        // A baseline that skipped every test, with the relevant tests compared: counted.
+        std::fs::write(
+            dir.path().join("comparison_results.json"),
+            r#"{"tests_reward": 0.0, "filtered_summary": {"missing_to_pass": 23, "missing_to_fail": 6, "pass_to_fail": 0}}"#,
+        )
+        .unwrap();
+        assert_eq!(tests_score(dir.path()).unwrap(), (0.7931, 0.0, 29));
     }
 
     #[test]
