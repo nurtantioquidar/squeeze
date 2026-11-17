@@ -298,6 +298,10 @@ struct ReplayArgs {
     /// With --compact-summary: compact only at pauses before a new ticket
     #[arg(long, requires = "compact_summary")]
     compact_tickets_only: bool,
+    /// With --compact-summary: summarize when the next prompt arrives (cache expired,
+    /// history read as uncached input) instead of in the background while it's warm
+    #[arg(long, requires = "compact_summary")]
+    compact_on_arrival: bool,
 }
 
 #[derive(Args)]
@@ -888,6 +892,7 @@ fn cmd_cache_sim(a: &ReplayArgs, files: &[PathBuf]) -> Result<()> {
             thinking: a.compact_thinking,
             reread: a.compact_reread,
             tickets_only: a.compact_tickets_only,
+            on_arrival: a.compact_on_arrival,
         }),
     };
     let sim = cachesim::simulate_files(files, &cfg)?;

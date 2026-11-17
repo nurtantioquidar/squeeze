@@ -113,6 +113,9 @@ pub struct Compaction {
     pub reread: f64,
     /// Compact only at pauses before a new ticket, not mid-ticket ones.
     pub tickets_only: bool,
+    /// Summarize when the next prompt arrives, after the cache has expired, as
+    /// uncached input, instead of in the background while it is still warm.
+    pub on_arrival: bool,
 }
 
 /// The summarizing request goes out this long before the cache would expire.
@@ -1043,9 +1046,14 @@ fn simulate_compaction(s: &Session, cal: &Calibration, cfg: &SimConfig, comp: &C
             let history = units(&c.msgs[..at], &summary);
             if history.iter().map(|u| u.1).sum::<f64>() >= comp.min_history {
                 // Summarize while the previous request's prefix is still cached.
-                let mut req = history.clone();
-                req.push((mix(u64::MAX, run.advances as u64), COMPACT_INSTRUCTION_TOKENS));
-                bill(&mut cache, &mut run.bill, lt + ttl - COMPACT_LEAD_SECS, &req, prev_keys);
+                if comp.on_arrival {
+                    run.bill.input +=
+                        s.sys_tokens + history.iter().map(|u| u.1).sum::<f64>() + COMPACT_INSTRUCTION_TOKENS;
+                } else {
+                    let mut req = history.clone();
+                    req.push((mix(u64::MAX, run.advances as u64), COMPACT_INSTRUCTION_TOKENS));
+                    bill(&mut cache, &mut run.bill, lt + ttl - COMPACT_LEAD_SECS, &req, prev_keys);
+                }
                 run.bill.output += comp.summary * (1.0 + comp.thinking);
                 let before = summary.as_ref().map_or(0, |(covered, _)| covered.len());
                 let results: f64 = c.msgs[before..at]
@@ -1340,6 +1348,7 @@ mod tests {
             thinking: 0.5,
             reread: 0.1,
             tickets_only: false,
+            on_arrival: false,
         };
         let small = simulate_compaction(&s, &FLAT, &cfg, &comp(500.0, 1000.0));
         // Pauses before the second follow-up and the fifth (every third human turn).
@@ -1355,6 +1364,9 @@ mod tests {
         // The pauses here are follow-ups, not new tickets.
         let tickets = simulate_compaction(&s, &FLAT, &cfg, &Compaction { tickets_only: true, ..comp(500.0, 1000.0) });
         assert_eq!(tickets.advances, 0);
+        // Summarizing after the cache expired reads the history at full price.
+        let late = simulate_compaction(&s, &FLAT, &cfg, &Compaction { on_arrival: true, ..comp(500.0, 1000.0) });
+        assert!(cost(&late) > cost(&small) && cost(&late) < cost(&base));
     }
 
     #[test]
