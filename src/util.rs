@@ -18,6 +18,26 @@ pub fn read_price(model: &str) -> f64 {
     if model.starts_with("claude-opus-5-5") || model.starts_with("claude-sonnet-5-5") { 0.05 } else { 0.1 }
 }
 
+/// List price in USD of a response's usage, for models whose price is known
+/// here (Opus 5.5: $4 per million input tokens, writes 1.25x for 5 minutes and
+/// 2x for an hour, reads 0.05x, output 5x); `None` for any other.
+pub fn usage_usd(model: &str, u: &crate::sse::Usage) -> Option<f64> {
+    if !model.starts_with("claude-opus-5-5") {
+        return None;
+    }
+    let (w1h, w5m) = if u.cache_creation_1h + u.cache_creation_5m > 0 {
+        (u.cache_creation_1h, u.cache_creation_5m)
+    } else {
+        (0, u.cache_creation_input_tokens)
+    };
+    let base = u.input_tokens as f64
+        + 2.0 * w1h as f64
+        + 1.25 * w5m as f64
+        + 0.05 * u.cache_read_input_tokens as f64
+        + 5.0 * u.output_tokens as f64;
+    Some(4.0 * base / 1e6)
+}
+
 /// Stable short hash of several string parts.
 pub fn short_hash(parts: &[&str]) -> String {
     let mut h = blake3::Hasher::new();

@@ -30,6 +30,8 @@ pub struct ThreadState {
     pub boundary: Option<String>,
     /// Server-side context editing, once the thread uses it.
     pub ctx: Option<CtxState>,
+    /// Compaction at pauses (`--compact-pauses`).
+    pub compact: crate::compact::CompactState,
 }
 
 /// Server-side context editing pinned at cold-cache moments: the proxy asks the
@@ -250,6 +252,11 @@ mod tests {
                 model: Some("claude-opus-5-5".into()),
                 ..Default::default()
             }),
+            compact: crate::compact::CompactState {
+                pending: Some(crate::compact::Summary { covered: 7, prefix_hash: "h".into(), text: "summary".into() }),
+                compactions: 1,
+                ..Default::default()
+            },
         };
         store.save_thread("k", &state);
         assert_eq!(store.load_thread("k"), Some(state));

@@ -7,6 +7,7 @@ pub mod atlas;
 pub mod auth;
 pub mod bench;
 pub mod cachesim;
+pub mod compact;
 pub mod compress;
 pub mod ctxmgmt;
 pub mod hook;

@@ -135,6 +135,10 @@ pub enum Arm {
     /// squeeze-proxy-cm that also clears the agent's older tool inputs
     /// (`--clear-tool-inputs`), e.g. the text of earlier Edit/Write calls.
     SqueezeProxyCmInputs,
+    /// squeeze-proxy plus compaction at pauses (`squeeze proxy --compact-pauses`,
+    /// API key only): the proxy summarizes the conversation in the background
+    /// before the cache expires, and sends the summary in its place.
+    SqueezeProxyCompact,
     /// Hook compression + MCP tools that replace Claude Code's file tools
     /// (Read/Edit/Write/Grep/Glob turned off), working guidance, and unused
     /// built-in tools trimmed (`squeeze run --replace-file-tools --trim-tools`).
@@ -166,6 +170,7 @@ impl Arm {
             Arm::SqueezeProxy => "squeeze-proxy",
             Arm::SqueezeProxyCm => "squeeze-proxy-cm",
             Arm::SqueezeProxyCmInputs => "squeeze-proxy-cm-inputs",
+            Arm::SqueezeProxyCompact => "squeeze-proxy-compact",
             Arm::SqueezeFull => "squeeze-full",
             Arm::SqueezeScout => "squeeze-scout",
             Arm::SqueezeCompact => "squeeze-compact",
@@ -180,6 +185,7 @@ impl Arm {
                 | Arm::SqueezeProxy
                 | Arm::SqueezeProxyCm
                 | Arm::SqueezeProxyCmInputs
+                | Arm::SqueezeProxyCompact
                 | Arm::SqueezeFull
                 | Arm::SqueezeScout
                 | Arm::SqueezeCompact
@@ -192,6 +198,7 @@ impl Arm {
             Arm::SqueezeProxy => Some(&[]),
             Arm::SqueezeProxyCm => Some(&["--context-edits", "cold"]),
             Arm::SqueezeProxyCmInputs => Some(&["--context-edits", "cold", "--clear-tool-inputs"]),
+            Arm::SqueezeProxyCompact => Some(&["--compact-pauses"]),
             _ => None,
         }
     }
@@ -280,13 +287,14 @@ impl std::str::FromStr for Arm {
             "squeeze-proxy" => Arm::SqueezeProxy,
             "squeeze-proxy-cm" => Arm::SqueezeProxyCm,
             "squeeze-proxy-cm-inputs" => Arm::SqueezeProxyCmInputs,
+            "squeeze-proxy-compact" => Arm::SqueezeProxyCompact,
             "squeeze-full" => Arm::SqueezeFull,
             "squeeze-scout" => Arm::SqueezeScout,
             "squeeze-compact" => Arm::SqueezeCompact,
             "squeeze-max" => Arm::SqueezeMax,
             other => {
                 bail!(
-                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-compact, squeeze-max, squeeze-hook, squeeze-mcp, squeeze-proxy, squeeze-proxy-cm, squeeze-proxy-cm-inputs)"
+                    "unknown arm {other:?} (vanilla, squeeze, squeeze-full, squeeze-scout, squeeze-compact, squeeze-max, squeeze-hook, squeeze-mcp, squeeze-proxy, squeeze-proxy-cm, squeeze-proxy-cm-inputs, squeeze-proxy-compact)"
                 )
             }
         })
@@ -430,6 +438,10 @@ pub struct SessionResult {
     /// (`agent` holds the main agent loop's tokens; both carry Claude Code's cost).
     #[serde(default)]
     pub agent_all_models: Usage,
+    /// Requests the proxy made itself for this session (compaction summaries),
+    /// at list prices: part of the session's cost, which Claude Code's figure misses.
+    #[serde(default)]
+    pub proxy_usd: f64,
 }
 
 impl SessionResult {
@@ -456,6 +468,31 @@ impl SessionResult {
     pub fn counts(&self) -> bool {
         self.completed && self.error.is_none()
     }
+    /// What the session cost: the agent's, plus the proxy's own requests.
+    pub fn cost_usd(&self) -> f64 {
+        self.agent.cost_usd + self.proxy_usd
+    }
+}
+
+/// What the proxy's own requests for `session` cost (the summaries of
+/// `--compact-pauses`), from the store's per-request records.
+pub fn proxy_cost(store_root: &Path, session: &str) -> f64 {
+    let Ok(store) = crate::store::Store::open(store_root) else { return 0.0 };
+    let mut total = 0.0;
+    for rec in store.records().unwrap_or_default() {
+        if rec.get("compaction").is_none() || rec.get("session").and_then(Value::as_str) != Some(session) {
+            continue;
+        }
+        let Some(u) = rec.get("usage").and_then(|u| serde_json::from_value::<crate::sse::Usage>(u.clone()).ok()) else {
+            continue;
+        };
+        let model = rec.get("model").and_then(Value::as_str).unwrap_or("");
+        match crate::util::usage_usd(model, &u) {
+            Some(usd) => total += usd,
+            None => tracing::warn!("no price for {model:?}: a compaction's cost is left out"),
+        }
+    }
+    total
 }
 
 /// Raised when Claude Code reports a usage or rate limit: the run stops and
@@ -689,6 +726,7 @@ pub async fn run_session(r: Run<'_>) -> Result<SessionResult> {
         tool_calls: BTreeMap::new(),
         grading_deferred: false,
         agent_all_models: Usage::default(),
+        proxy_usd: 0.0,
     };
     match session_inner(&r, model.as_deref(), &mut res).await {
         Ok(()) => res.completed = res.tickets.iter().all(|t| t.error.is_none()),
@@ -1035,10 +1073,10 @@ pub fn summarize(results: &[SessionResult]) -> String {
     for b in bundles {
         let vanilla: BTreeMap<(String, usize), f64> = groups
             .get(&(b.clone(), Arm::Vanilla))
-            .map(|v| v.iter().map(|r| ((r.bundle.clone(), r.repeat), r.agent.cost_usd)).collect())
+            .map(|v| v.iter().map(|r| ((r.bundle.clone(), r.repeat), r.cost_usd())).collect())
             .unwrap_or_default();
         for ((gb, arm), rs) in groups.iter().filter(|((gb, _), _)| *gb == b) {
-            let costs: Vec<f64> = rs.iter().map(|r| r.agent.cost_usd).collect();
+            let costs: Vec<f64> = rs.iter().map(|r| r.cost_usd()).collect();
             // A session's reward counts once all its tickets are graded.
             let rewards: Vec<f64> = rs.iter().filter(|r| r.awaiting_grading() == 0).map(|r| r.reward).collect();
             let turns: Vec<f64> = rs.iter().map(|r| r.agent.turns as f64).collect();
@@ -1049,7 +1087,7 @@ pub fn summarize(results: &[SessionResult]) -> String {
             } else {
                 let pairs: Vec<(f64, f64)> = rs
                     .iter()
-                    .filter_map(|r| vanilla.get(&(r.bundle.clone(), r.repeat)).map(|v| (r.agent.cost_usd, *v)))
+                    .filter_map(|r| vanilla.get(&(r.bundle.clone(), r.repeat)).map(|v| (r.cost_usd(), *v)))
                     .collect();
                 let (a, v) = pairs.iter().fold((0.0, 0.0), |acc, p| (acc.0 + p.0, acc.1 + p.1));
                 match ((v > 0.0).then(|| a / v), bootstrap_ratio(&pairs)) {
@@ -1076,11 +1114,14 @@ pub fn summarize(results: &[SessionResult]) -> String {
     }
     let helper: f64 = results.iter().map(|r| r.helpers.cost_usd).sum();
     let agent: f64 = results.iter().map(|r| r.agent.cost_usd).sum();
+    let proxy: f64 = results.iter().map(|r| r.proxy_usd).sum();
     let _ = writeln!(
         out,
         "\nsqueezed = outputs the hook compressed per session; sq tools = calls to squeeze's MCP tools per session.\n\
-         agent $ is Claude Code's own list-price figure for the coding agent; on a subscription it measures usage,\n\
-         not a bill. Agents used ${agent:.4} in all; simulated user + judge another ${helper:.4}."
+         agent $ is Claude Code's own list-price figure for the coding agent, plus any requests the proxy made itself\n\
+         for the session; on a subscription it measures usage, not a bill. Agents used ${agent:.4} in all{}; simulated\n\
+         user + judge another ${helper:.4}.",
+        if proxy > 0.0 { format!(", the proxy ${proxy:.4} more") } else { String::new() }
     );
     let left_out = results.iter().filter(|r| !r.counts()).count();
     if left_out > 0 {
@@ -1177,6 +1218,7 @@ mod tests {
             tool_calls: BTreeMap::new(),
             grading_deferred: false,
             agent_all_models: Usage::default(),
+            proxy_usd: 0.0,
         }
     }
 
@@ -1281,7 +1323,7 @@ mod tests {
 
     #[test]
     fn arms_that_replace_file_tools_serve_squeeze_tools() {
-        let names = "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-max,squeeze-hook,squeeze-mcp,squeeze-proxy,squeeze-proxy-cm,squeeze-proxy-cm-inputs";
+        let names = "vanilla,squeeze,squeeze-full,squeeze-scout,squeeze-compact,squeeze-max,squeeze-hook,squeeze-mcp,squeeze-proxy,squeeze-proxy-cm,squeeze-proxy-cm-inputs,squeeze-proxy-compact";
         for name in names.split(',') {
             let arm: Arm = name.parse().unwrap();
             assert_eq!(arm.name(), name);
@@ -1303,6 +1345,25 @@ mod tests {
         let mut s = crate::hook::session_settings(exe, Arm::SqueezeCompact.uses_mcp());
         Arm::SqueezeCompact.tune_settings(&mut s, exe);
         assert!(s["hooks"]["PreCompact"].is_null(), "only squeeze-max changes the hooks");
+    }
+
+    #[test]
+    fn the_proxys_own_requests_count_in_the_session_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(dir.path()).unwrap();
+        let usage = json!({ "input_tokens": 1_000_000, "output_tokens": 0, "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0, "cache_creation_1h": 0, "cache_creation_5m": 0 });
+        for (session, compaction) in [("s1", true), ("s1", false), ("s2", true)] {
+            let mut rec = json!({ "session": session, "model": "claude-opus-5-5", "usage": usage });
+            if compaction {
+                rec["compaction"] = json!({ "stored": true });
+            }
+            store.append_record(&rec).unwrap();
+        }
+        assert!((proxy_cost(dir.path(), "s1") - 4.0).abs() < 1e-9, "only s1's summaries, at $4 per Mtok");
+        let mut r = session(Arm::SqueezeProxyCompact, 0, 2.0, 0.9);
+        r.proxy_usd = proxy_cost(dir.path(), "s1");
+        assert!((r.cost_usd() - 6.0).abs() < 1e-9);
     }
 
     #[test]

@@ -126,6 +126,7 @@ async fn real_claude_code_through_squeeze() {
         transform: Some(TransformConfig { expand_hint: ExpandHint::Mcp, ..Default::default() }),
         store,
         ctx: None,
+        compact: None,
     })
     .unwrap();
     let addr = proxy.spawn("127.0.0.1:0").await.unwrap();
@@ -318,6 +319,7 @@ async fn context_edits_session(one_hour: bool) -> CmSession {
         transform: Some(transform),
         store: Store::open(&home).unwrap(),
         ctx: Some(ctx),
+        compact: None,
     };
     let proxy = Proxy::with_clock(cfg, clock.clone()).unwrap();
     let addr = proxy.spawn("127.0.0.1:0").await.unwrap();

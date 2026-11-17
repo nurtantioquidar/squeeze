@@ -49,6 +49,7 @@ async fn setup(transform: bool) -> (common::Mock, Proxy, String, tempfile::TempD
         transform: transform.then(TransformConfig::default),
         store,
         ctx: None,
+        compact: None,
     })
     .unwrap();
     let addr = proxy.spawn("127.0.0.1:0").await.unwrap();
@@ -204,9 +205,11 @@ async fn prune_proxy(clock: &Arc<FakeClock>, store_dir: &Path, request_secs: u64
     let mut cfg = TransformConfig::default();
     cfg.prune.enabled = true;
     let store = Store::open(store_dir).unwrap();
-    let proxy =
-        Proxy::with_clock(ProxyConfig { upstream: mock.url(), transform: Some(cfg), store, ctx: None }, clock.clone())
-            .unwrap();
+    let proxy = Proxy::with_clock(
+        ProxyConfig { upstream: mock.url(), transform: Some(cfg), store, ctx: None, compact: None },
+        clock.clone(),
+    )
+    .unwrap();
     let addr = proxy.spawn("127.0.0.1:0").await.unwrap();
     (mock, format!("http://{addr}"))
 }
@@ -424,6 +427,7 @@ async fn cm_proxy_with(
         transform: Some(transform),
         store: Store::open(store_dir).unwrap(),
         ctx: Some(ctx),
+        compact: None,
     };
     let proxy = Proxy::with_clock(cfg, clock.clone()).unwrap();
     let addr = proxy.spawn("127.0.0.1:0").await.unwrap();
@@ -883,4 +887,125 @@ async fn a_refill_is_counted_as_a_cost() {
     let rec = last_record(dir.path());
     assert!((rec["saved_input_eq"].as_f64().unwrap() + 0.1 * added).abs() < 1e-6, "then read: {rec}");
     assert!(proxy.totals().saved_input_eq < 0.0);
+}
+
+/// A proxy with `--compact-pauses` (summarizing after 1 s of real idleness)
+/// in front of a mock that answers every turn with `end_turn` on a large
+/// prompt, and a summarizing request with a summary.
+async fn compact_proxy(clock: &Arc<FakeClock>, store_dir: &Path) -> (common::Mock, String) {
+    let mock = common::start(Arc::new(|r: &common::Recorded| {
+        let body = r.json();
+        if body["stream"] == false {
+            return Reply::Json(
+                200,
+                json!({ "type": "message", "role": "assistant", "model": "mock-model", "stop_reason": "end_turn",
+                        "content": [{ "type": "text", "text": format!("SUMMARY {}", "s".repeat(400)) }],
+                        "usage": { "input_tokens": 30_000, "cache_read_input_tokens": 18_000,
+                                   "cache_creation_input_tokens": 0, "output_tokens": 700 } }),
+            );
+        }
+        let usage = json!({ "input_tokens": 3, "cache_creation_input_tokens": 1_000,
+                            "cache_read_input_tokens": 40_000, "output_tokens": 50 });
+        Reply::Sse(common::sse_text_with(0, "Done.", usage, json!({})))
+    }))
+    .await;
+    let compact = squeeze::compact::CompactConfig { idle_secs: Some(1), min_tokens: 5_000 };
+    let cfg = ProxyConfig {
+        upstream: mock.url(),
+        transform: Some(TransformConfig::default()),
+        store: Store::open(store_dir).unwrap(),
+        ctx: None,
+        compact: Some(compact),
+    };
+    let proxy = Proxy::with_clock(cfg, clock.clone()).unwrap();
+    let addr = proxy.spawn("127.0.0.1:0").await.unwrap();
+    (mock, format!("http://{addr}"))
+}
+
+/// `cm_conversation(6, 2)`, then the turn's final reply and the user's next prompt.
+fn after_the_pause() -> Value {
+    let mut b = cm_conversation(6, 2);
+    let m = b["messages"].as_array_mut().unwrap();
+    m.push(json!({ "role": "assistant", "content": [
+        { "type": "thinking", "thinking": "", "signature": "sig-final" }, { "type": "text", "text": "Done." }
+    ] }));
+    m.push(json!({ "role": "user", "content": "next ticket" }));
+    b
+}
+
+fn summarizing(mock: &common::Mock) -> Vec<common::Recorded> {
+    mock.requests().into_iter().filter(|r| r.json()["stream"] == false).collect()
+}
+
+#[tokio::test]
+async fn compaction_summarizes_at_a_pause_and_sends_the_summary_from_then_on() {
+    let (clock, dir) = (Arc::new(FakeClock::default()), tempfile::tempdir().unwrap());
+    let (mock, url) = compact_proxy(&clock, dir.path()).await;
+    let turn = cm_conversation(6, 2);
+    let sent = cm_send(&url, &mock, &clock, T0, MESSAGES, &turn).await;
+    assert_eq!(sent.json(), turn, "nothing changes before a summary exists");
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+
+    // The summarizing request: the turn as forwarded, with the instruction, as squeeze's own request.
+    let s = summarizing(&mock);
+    assert_eq!(s.len(), 1, "one summary per pause");
+    let h = |n: &str| s[0].headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    assert_eq!(h("x-api-key"), "sk-ant-api03-test");
+    assert!(
+        !h("anthropic-beta").contains("claude-code-20250219") && h("anthropic-beta").contains("context-management")
+    );
+    assert!(h("user-agent").starts_with("squeeze/"));
+    let body = s[0].json();
+    assert!(!body["messages"].to_string().contains("cache_control"), "no cache writes for the conversation");
+    let n = turn["messages"].as_array().unwrap().len();
+    assert_eq!(body["messages"].as_array().unwrap().len(), n);
+    let last = body["messages"][n - 1]["content"].as_array().unwrap();
+    assert_eq!(last.last().unwrap()["text"], squeeze::compact::INSTRUCTION);
+
+    // The request after the pause: first message + summary, the final reply without thinking, the prompt.
+    let next = after_the_pause();
+    let up = cm_send(&url, &mock, &clock, T0 + 400, MESSAGES, &next).await.json();
+    let m = up["messages"].as_array().unwrap();
+    assert_eq!(m.len(), 3);
+    assert_eq!(m[0]["content"][0]["text"], "look around");
+    assert!(m[0]["content"][1]["text"].as_str().unwrap().contains("SUMMARY sss"));
+    assert_eq!(m[1]["content"], json!([{ "type": "text", "text": "Done." }]));
+    assert_eq!(m[2], next["messages"].as_array().unwrap().last().unwrap().clone());
+    let mut rest = up.clone();
+    rest.as_object_mut().unwrap().remove("messages");
+    let mut expect = next.clone();
+    expect.as_object_mut().unwrap().remove("messages");
+    assert_eq!(rest, expect, "every other field as sent");
+
+    // And from then on, new turns verbatim after it.
+    let mut later = after_the_pause();
+    later["messages"].as_array_mut().unwrap().extend(cat_loop("toolu_c00"));
+    let up = cm_send(&url, &mock, &clock, T0 + 410, MESSAGES, &later).await.json();
+    assert_eq!(up["messages"].as_array().unwrap().len(), 5);
+    assert_eq!(up["messages"][4], later["messages"].as_array().unwrap().last().unwrap().clone());
+
+    // The summary's cost is on record, under the request's session.
+    let recs = Store::open(dir.path()).unwrap().records().unwrap();
+    let c: Vec<&Value> = recs.iter().filter(|r| r.get("compaction").is_some()).collect();
+    assert_eq!(c.len(), 1);
+    assert_eq!(
+        (c[0]["compaction"]["stored"].clone(), c[0]["usage"]["output_tokens"].clone()),
+        (json!(true), json!(700))
+    );
+}
+
+#[tokio::test]
+async fn a_request_before_the_pause_ends_cancels_the_summary() {
+    let (clock, dir) = (Arc::new(FakeClock::default()), tempfile::tempdir().unwrap());
+    let (mock, url) = compact_proxy(&clock, dir.path()).await;
+    cm_send(&url, &mock, &clock, T0, MESSAGES, &cm_conversation(6, 2)).await;
+    // The user answers at once: same thread, before the 1 s idle threshold.
+    let next = after_the_pause();
+    let up = cm_send(&url, &mock, &clock, T0 + 5, MESSAGES, &next).await;
+    assert_eq!(up.json(), next);
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+    // That reply ended a turn too, so its own pause may summarize; the first never did.
+    for s in summarizing(&mock) {
+        assert_eq!(s.json()["messages"].as_array().unwrap().len(), next["messages"].as_array().unwrap().len());
+    }
 }

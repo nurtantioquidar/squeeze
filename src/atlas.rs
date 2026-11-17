@@ -337,11 +337,13 @@ pub async fn run_session(
         tool_calls: BTreeMap::new(),
         grading_deferred: false,
         agent_all_models: Usage::default(),
+        proxy_usd: 0.0,
     };
     res.grading_deferred = ctx.defer_grading || previous.is_some_and(|p| p.grading_deferred);
     let outcome = session_inner(ctx, d, bundle, arm, model.as_deref(), &sdir, &mut res).await;
     // Counted from the session's own files, so it also covers sessions that stopped early.
     bench::record_activity_in(&sdir.join("squeeze-home"), &sdir.join("claude-config"), &mut res);
+    res.proxy_usd = bench::proxy_cost(&ctx.host.store_root, &res.session_id);
     match outcome {
         Ok(()) => {
             res.completed = res.tickets.len() == bundle.tasks.len() && res.tickets.iter().all(|t| t.error.is_none())
@@ -996,6 +998,7 @@ pub async fn regrade_session(
     // Recount from the session's own files; this also corrects rows recorded
     // before costs were read as running totals.
     bench::record_activity_in(&sdir.join("squeeze-home"), &sdir.join("claude-config"), r);
+    r.proxy_usd = r.proxy_usd.max(bench::proxy_cost(&ctx.host.store_root, &r.session_id));
     Ok(())
 }
 
@@ -1147,6 +1150,7 @@ mod tests {
             tool_calls: BTreeMap::new(),
             grading_deferred: false,
             agent_all_models: Usage::default(),
+            proxy_usd: 0.0,
         };
         save_checkpoint(sdir, &cfg, &res, true, Some(&ticket("t2"))).unwrap();
         let cp: Checkpoint = serde_json::from_slice(&std::fs::read(sdir.join(CHECKPOINT)).unwrap()).unwrap();

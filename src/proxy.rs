@@ -13,6 +13,7 @@
 //! forwarded (see [`crate::auth`]).
 
 use crate::auth;
+use crate::compact::{self, CompactConfig, Credentials};
 use crate::ctxmgmt::{self, CtxConfig, Expected};
 use crate::sse::{Usage, UsageTap};
 use crate::store::{CtxState, Store, ThreadState};
@@ -65,6 +66,8 @@ pub struct ProxyConfig {
     /// Server-side context editing (`--context-edits cold`); `None` leaves
     /// `context_management` as the client sent it.
     pub ctx: Option<CtxConfig>,
+    /// Compaction at pauses (`--compact-pauses`, API keys only).
+    pub compact: Option<CompactConfig>,
 }
 
 #[derive(Clone)]
@@ -77,9 +80,13 @@ struct Inner {
     upstream: String,
     transform: Option<TransformConfig>,
     ctx: Option<CtxConfig>,
+    compact: Option<CompactConfig>,
     store: Store,
     clock: Arc<dyn Clock>,
     threads: Mutex<HashMap<String, ThreadState>>,
+    /// Messages requests seen per thread, so a scheduled compaction knows
+    /// whether another request came after the one that scheduled it.
+    generations: Mutex<HashMap<String, u64>>,
     /// tool_use ids whose rewrite has already been billed once (as a cache write).
     counted: Mutex<HashSet<String>>,
     totals: Mutex<Totals>,
@@ -98,6 +105,10 @@ pub struct Totals {
     pub ctx_advances: u64,
     /// Input tokens server-side context editing cleared, summed over requests.
     pub cleared_input_tokens: u64,
+    /// Summarizing requests the proxy made itself (`--compact-pauses`), and
+    /// the summaries they produced.
+    pub compaction_requests: u64,
+    pub compactions: u64,
     pub bytes_saved: u64,
     /// Estimated input-side savings, in base-input-token equivalents.
     pub saved_input_eq: f64,
@@ -139,9 +150,11 @@ impl Proxy {
                 upstream: cfg.upstream.trim_end_matches('/').to_string(),
                 transform: cfg.transform,
                 ctx: cfg.ctx,
+                compact: cfg.compact,
                 store: cfg.store,
                 clock,
                 threads: Mutex::default(),
+                generations: Mutex::default(),
                 counted: Mutex::default(),
                 totals: Mutex::default(),
             }),
@@ -208,6 +221,10 @@ async fn handle(State(inner): State<Arc<Inner>>, req: Request) -> Response {
         let n = lock(&inner.totals).requests;
         let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}-{n}.json", now_secs())), &out);
     }
+    if let Some(job) = pending.as_mut().and_then(|p| p.compact.as_mut()) {
+        job.forwarded = Some(out.clone());
+        job.credentials = Credentials::from_headers(&parts.headers);
+    }
     let url = format!("{}{}", inner.upstream, path_and_query);
     let upstream = inner
         .client
@@ -269,6 +286,20 @@ struct Pending {
     /// The start this request stamped on its thread, and the one it replaced.
     stamp: Option<(u64, Option<u64>)>,
     ctx: Option<CtxRequest>,
+    /// What a compaction at the next pause needs (`--compact-pauses`).
+    compact: Option<CompactJob>,
+}
+
+/// A request that may end a turn, and what summarizing its conversation needs.
+struct CompactJob {
+    /// The thread's generation this request made.
+    generation: u64,
+    /// The client's messages and their hash.
+    covered: usize,
+    prefix_hash: String,
+    /// The body as forwarded.
+    forwarded: Option<Bytes>,
+    credentials: Option<Credentials>,
 }
 
 /// What context editing did to a request.
@@ -302,12 +333,18 @@ fn prepare(
 
     let mut stats = TransformStats::default();
     let mut rewritten = None;
-    let (mut thread, mut stamp, mut ctx) = (None, None, None);
-    if inner.transform.is_some() || inner.ctx.is_some() {
-        let tracked = inner.ctx.is_some() || inner.transform.as_ref().is_some_and(|c| c.prune.enabled);
+    let (mut thread, mut stamp, mut ctx, mut job) = (None, None, None, None);
+    if inner.transform.is_some() || inner.ctx.is_some() || inner.compact.is_some() {
+        let tracked =
+            inner.ctx.is_some() || inner.compact.is_some() || inner.transform.as_ref().is_some_and(|c| c.prune.enabled);
         let mut sink = inner.store.clone();
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let tick = tracked.then(|| thread_tick(inner, &body, headers, is_messages)).flatten();
+            // The summary goes in first: everything after works on what's sent.
+            let (compacted, job) = match (&inner.compact, &tick) {
+                (Some(_), Some(t)) => compact_step(inner, &mut body, t, is_messages),
+                _ => (false, None),
+            };
             let boundary = tick.as_ref().and_then(|t| t.boundary.clone());
             let s = inner
                 .transform
@@ -318,10 +355,11 @@ fn prepare(
                 (Some(cfg), Some(t)) => Some(ctx_step(inner, cfg, &mut body, headers, t, is_messages)),
                 _ => None,
             };
-            (tick, s, c)
+            (tick, s, c, compacted, job)
         }));
         match result {
-            Ok((tick, s, c)) => {
+            Ok((tick, s, c, compacted, j)) => {
+                job = j;
                 if let Some(t) = tick {
                     if t.cold {
                         tracing::info!(
@@ -334,7 +372,7 @@ fn prepare(
                     stamp = t.started.map(|start| (start, t.prev_start));
                     thread = is_messages.then_some(t.key);
                 }
-                let edited = c.as_ref().is_some_and(|c| c.expected.is_some());
+                let edited = c.as_ref().is_some_and(|c| c.expected.is_some()) || compacted;
                 if s.changed() || edited {
                     match serde_json::to_vec(&body) {
                         Ok(v) => {
@@ -345,6 +383,7 @@ fn prepare(
                         Err(e) => {
                             tracing::warn!("could not re-serialize the request, forwarding it unchanged: {e}");
                             ctx = c.map(|c| CtxRequest { expected: None, ..c });
+                            job = None;
                         }
                     }
                 } else {
@@ -355,9 +394,41 @@ fn prepare(
             Err(_) => tracing::error!("transform panicked; forwarding the request unchanged"),
         }
     }
-    let pending =
-        is_messages.then(|| Pending { inner: inner.clone(), session, model, stats, ttl_1h, thread, stamp, ctx });
+    let pending = is_messages.then(|| Pending {
+        inner: inner.clone(),
+        session,
+        model,
+        stats,
+        ttl_1h,
+        thread,
+        stamp,
+        ctx,
+        compact: job,
+    });
     (rewritten, pending)
+}
+
+/// Compaction for one request: put the thread's summary in, and note what
+/// summarizing this request's conversation would need, should it end a turn.
+fn compact_step(inner: &Inner, body: &mut Value, tick: &Tick, is_messages: bool) -> (bool, Option<CompactJob>) {
+    let job = match (is_messages, tick.generation, body.get("messages").and_then(Value::as_array)) {
+        (true, Some(generation), Some(m)) => Some(CompactJob {
+            generation,
+            covered: m.len(),
+            prefix_hash: compact::messages_hash(m),
+            forwarded: None,
+            credentials: None,
+        }),
+        _ => None,
+    };
+    let mut threads = lock(&inner.threads);
+    let Some(state) = threads.get_mut(&tick.key) else { return (false, job) };
+    let before = state.compact.clone();
+    let changed = compact::apply(body, &mut state.compact, is_messages);
+    if state.compact != before {
+        inner.store.save_thread(&tick.key, state);
+    }
+    (changed, job)
 }
 
 /// Context editing for one request: census its history, advance the thread's
@@ -426,6 +497,8 @@ struct Tick {
     /// The start this request stamped (messages requests only), and the one before.
     started: Option<u64>,
     prev_start: Option<u64>,
+    /// The thread's generation this request made (messages requests only).
+    generation: Option<u64>,
 }
 
 /// Stamp a messages request's start in its thread and tell whether the prompt
@@ -451,6 +524,7 @@ fn thread_tick(inner: &Inner, body: &Value, headers: &HeaderMap, is_messages: bo
             boundary,
             started: None,
             prev_start: None,
+            generation: None,
         });
     }
     let state = threads.entry(key.clone()).or_insert_with(|| open_thread(&inner.store, &key, anchor.as_deref()));
@@ -468,7 +542,15 @@ fn thread_tick(inner: &Inner, body: &Value, headers: &HeaderMap, is_messages: bo
     }
     let prev_start = state.last_start.replace(now);
     inner.store.save_thread(&key, state);
-    Some(Tick { key, cold, warm, idle_secs, boundary: state.boundary.clone(), started: Some(now), prev_start })
+    let boundary = state.boundary.clone();
+    drop(threads);
+    let generation = {
+        let mut generations = lock(&inner.generations);
+        let g = generations.entry(key.clone()).or_default();
+        *g += 1;
+        *g
+    };
+    Some(Tick { key, cold, warm, idle_secs, boundary, started: Some(now), prev_start, generation: Some(generation) })
 }
 
 /// Which thread a request belongs to. Once the conversation has a tool call,
@@ -626,6 +708,104 @@ impl Pending {
         if let Err(e) = self.inner.store.append_record(&rec) {
             tracing::warn!("could not write stats: {e}");
         }
+        // A turn that ended: summarize its conversation if the thread then pauses.
+        if let (Some(cfg), Some(job), Some(key), Some((started, _)), Some(u)) =
+            (self.inner.compact, self.compact, self.thread, self.stamp, usage.as_ref())
+            && ok
+            && u.stop_reason.as_deref() == Some("end_turn")
+            && job.credentials.is_some()
+            && job.forwarded.is_some()
+        {
+            let inner = self.inner.clone();
+            tokio::spawn(compact_later(inner, cfg, key, self.session, model, started, job));
+        }
+    }
+}
+
+/// Wait for the pause, then have the turn's conversation summarized and keep
+/// the summary for the thread's next request. Gives up, dropping the
+/// credentials, when another request on the thread comes first.
+async fn compact_later(
+    inner: Arc<Inner>,
+    cfg: CompactConfig,
+    key: String,
+    session: Option<String>,
+    model: Option<String>,
+    started: u64,
+    job: CompactJob,
+) {
+    let CompactJob { generation, covered, prefix_hash, forwarded, credentials } = job;
+    let (Some(forwarded), Some(credentials)) = (forwarded, credentials) else { return };
+    let Ok(body) = serde_json::from_slice::<Value>(&forwarded) else { return };
+    let conversation = body.get("messages").map_or(0, |m| m.to_string().len());
+    if approx_tokens(conversation) < cfg.min_tokens as f64 {
+        return;
+    }
+    let idle = cfg
+        .idle_secs
+        .unwrap_or_else(|| transform::message_cache_ttl_secs(&body).saturating_sub(compact::IDLE_LEAD_SECS));
+    let wait = (started + idle).saturating_sub(inner.clock.now_secs());
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+    let current = |inner: &Inner| lock(&inner.generations).get(&key).copied() == Some(generation);
+    if !current(&inner) {
+        return;
+    }
+    let Some(request) = compact::summary_request(&body) else { return };
+    let Ok(payload) = serde_json::to_vec(&request) else { return };
+    let sent = credentials
+        .apply(inner.client.post(format!("{}/v1/messages", inner.upstream)))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::USER_AGENT, concat!("squeeze/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(600))
+        .body(payload)
+        .send()
+        .await;
+    drop(credentials);
+    let (status, bytes) = match sent {
+        Ok(r) => (r.status().as_u16(), r.bytes().await.unwrap_or_default()),
+        Err(e) => {
+            tracing::warn!("compaction for thread {key}: the summarizing request failed: {e}");
+            return;
+        }
+    };
+    let mut tap = UsageTap::new(false);
+    tap.feed(&bytes);
+    let usage = tap.finish();
+    let summary = serde_json::from_slice::<Value>(&bytes).ok().as_ref().and_then(compact::summary_text);
+    let stored = summary.as_ref().is_some_and(|text| {
+        if !current(&inner) {
+            return false;
+        }
+        let mut threads = lock(&inner.threads);
+        let Some(state) = threads.get_mut(&key) else { return false };
+        state.compact.pending = Some(compact::Summary { covered, prefix_hash, text: text.clone() });
+        state.compact.compactions += 1;
+        inner.store.save_thread(&key, state);
+        true
+    });
+    tracing::info!(
+        "compaction for thread {key}: {}",
+        if stored { "summary ready for the next request" } else { "no summary kept" }
+    );
+    {
+        let mut t = lock(&inner.totals);
+        t.compaction_requests += 1;
+        t.compactions += u64::from(stored);
+        if let Some(u) = &usage {
+            t.usage.add(u);
+        }
+    }
+    let rec = json!({
+        "ts": now_secs(),
+        "session": session,
+        "model": usage.as_ref().and_then(|u| u.model.clone()).or(model),
+        "status": status,
+        "compaction": { "thread": key, "covered": covered, "stored": stored,
+                        "summary_chars": summary.as_ref().map_or(0, String::len) },
+        "usage": usage,
+    });
+    if let Err(e) = inner.store.append_record(&rec) {
+        tracing::warn!("could not write stats: {e}");
     }
 }
 

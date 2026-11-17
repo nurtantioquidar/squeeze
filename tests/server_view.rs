@@ -233,7 +233,13 @@ async fn replay(requests: &[Rebuilt], ctx: Option<CtxConfig>, store: &Path) -> R
     let ok = json!({ "type": "text", "text": "ok" });
     let mock = common::start(Arc::new(move |r: &Recorded| answer.respond(r, vec![ok.clone()], "end_turn"))).await;
     let transform = TransformConfig { ctx_window: ctx.map(|c| c.window), ..Default::default() };
-    let cfg = ProxyConfig { upstream: mock.url(), transform: Some(transform), store: Store::open(store).unwrap(), ctx };
+    let cfg = ProxyConfig {
+        upstream: mock.url(),
+        transform: Some(transform),
+        store: Store::open(store).unwrap(),
+        ctx,
+        compact: None,
+    };
     let proxy = Proxy::with_clock(cfg, clock.clone()).unwrap();
     let addr = proxy.spawn("127.0.0.1:0").await.unwrap();
     let client = reqwest::Client::new();

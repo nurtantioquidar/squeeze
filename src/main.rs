@@ -100,6 +100,18 @@ struct CompressFlags {
     /// With --context-edits: clear tool inputs (the agent's older Edit and Write text) too
     #[arg(long)]
     clear_tool_inputs: bool,
+    /// Experimental, API keys only: when a turn has ended and its conversation stays idle
+    /// until shortly before the prompt cache would expire, have it summarized in the
+    /// background, and send the summary in place of the earlier conversation from the next
+    /// request on. The summary is one extra request the proxy makes itself, with the API key
+    /// of the request that ended the turn, held in memory only until then. Not with
+    /// --context-edits cold
+    #[arg(long, conflicts_with_all = ["prune_cold_cache", "no_compress"])]
+    compact_pauses: bool,
+    /// With --compact-pauses: summarize after this many idle seconds instead of a minute
+    /// before the cache expires (for testing)
+    #[arg(long, hide = true, requires = "compact_pauses")]
+    compact_idle_secs: Option<u64>,
     /// With --context-edits: also clear thinking from before the latest human prompt.
     /// Off by default: Claude Code sends old thinking without its text (about 30-50
     /// tokens a turn), and the API counts a thinking turn at every reminder Claude Code
@@ -152,8 +164,24 @@ impl CompressFlags {
         Ok(Some(t))
     }
 
+    fn compact(&self) -> Result<Option<squeeze::compact::CompactConfig>> {
+        if !self.compact_pauses || self.disabled() {
+            return Ok(None);
+        }
+        if self.context_edits != ContextEdits::Off {
+            bail!("--compact-pauses and --context-edits cold don't go together");
+        }
+        Ok(Some(squeeze::compact::CompactConfig { idle_secs: self.compact_idle_secs, ..Default::default() }))
+    }
+
     fn proxy_config(&self, hint: ExpandHint, store: Store) -> Result<ProxyConfig> {
-        Ok(ProxyConfig { upstream: self.upstream(), transform: self.transform(hint)?, store, ctx: self.ctx()? })
+        Ok(ProxyConfig {
+            upstream: self.upstream(),
+            transform: self.transform(hint)?,
+            store,
+            ctx: self.ctx()?,
+            compact: self.compact()?,
+        })
     }
 
     fn upstream(&self) -> String {
