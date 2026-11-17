@@ -113,9 +113,24 @@ pub struct Compaction {
     pub reread: f64,
     /// Compact only at pauses before a new ticket, not mid-ticket ones.
     pub tickets_only: bool,
-    /// Summarize when the next prompt arrives, after the cache has expired, as
-    /// uncached input, instead of in the background while it is still warm.
-    pub on_arrival: bool,
+    /// What the summarizing request finds in the prompt cache.
+    pub cache: SummaryCache,
+}
+
+/// What a summarizing request reads from the prompt cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SummaryCache {
+    /// In the background while the cache is warm, sharing the conversation's
+    /// cache entries: everything before the instruction is read.
+    Warm,
+    /// In the background while the cache is warm, but under another cache key
+    /// for messages: the system prompt and tools are read, the conversation is
+    /// uncached input. Measured (2026-11-17): a request without Claude Code's
+    /// `claude-code-20250219` beta shares only the system prompt and tools with
+    /// Claude Code's own cache entries.
+    SystemOnly,
+    /// When the next prompt arrives, after the cache expired: all uncached input.
+    Cold,
 }
 
 /// The summarizing request goes out this long before the cache would expire.
@@ -1046,13 +1061,18 @@ fn simulate_compaction(s: &Session, cal: &Calibration, cfg: &SimConfig, comp: &C
             let history = units(&c.msgs[..at], &summary);
             if history.iter().map(|u| u.1).sum::<f64>() >= comp.min_history {
                 // Summarize while the previous request's prefix is still cached.
-                if comp.on_arrival {
-                    run.bill.input +=
-                        s.sys_tokens + history.iter().map(|u| u.1).sum::<f64>() + COMPACT_INSTRUCTION_TOKENS;
-                } else {
-                    let mut req = history.clone();
-                    req.push((mix(u64::MAX, run.advances as u64), COMPACT_INSTRUCTION_TOKENS));
-                    bill(&mut cache, &mut run.bill, lt + ttl - COMPACT_LEAD_SECS, &req, prev_keys);
+                let conversation = history.iter().map(|u| u.1).sum::<f64>() + COMPACT_INSTRUCTION_TOKENS;
+                match comp.cache {
+                    SummaryCache::Cold => run.bill.input += s.sys_tokens + conversation,
+                    SummaryCache::SystemOnly => {
+                        run.bill.cache_read += s.sys_tokens;
+                        run.bill.input += conversation;
+                    }
+                    SummaryCache::Warm => {
+                        let mut req = history.clone();
+                        req.push((mix(u64::MAX, run.advances as u64), COMPACT_INSTRUCTION_TOKENS));
+                        bill(&mut cache, &mut run.bill, lt + ttl - COMPACT_LEAD_SECS, &req, prev_keys);
+                    }
                 }
                 run.bill.output += comp.summary * (1.0 + comp.thinking);
                 let before = summary.as_ref().map_or(0, |(covered, _)| covered.len());
@@ -1348,7 +1368,7 @@ mod tests {
             thinking: 0.5,
             reread: 0.1,
             tickets_only: false,
-            on_arrival: false,
+            cache: SummaryCache::Warm,
         };
         let small = simulate_compaction(&s, &FLAT, &cfg, &comp(500.0, 1000.0));
         // Pauses before the second follow-up and the fifth (every third human turn).
@@ -1365,8 +1385,15 @@ mod tests {
         let tickets = simulate_compaction(&s, &FLAT, &cfg, &Compaction { tickets_only: true, ..comp(500.0, 1000.0) });
         assert_eq!(tickets.advances, 0);
         // Summarizing after the cache expired reads the history at full price.
-        let late = simulate_compaction(&s, &FLAT, &cfg, &Compaction { on_arrival: true, ..comp(500.0, 1000.0) });
-        assert!(cost(&late) > cost(&small) && cost(&late) < cost(&base));
+        let late =
+            simulate_compaction(&s, &FLAT, &cfg, &Compaction { cache: SummaryCache::Cold, ..comp(500.0, 1000.0) });
+        let sys = simulate_compaction(
+            &s,
+            &FLAT,
+            &cfg,
+            &Compaction { cache: SummaryCache::SystemOnly, ..comp(500.0, 1000.0) },
+        );
+        assert!(cost(&small) < cost(&sys) && cost(&sys) < cost(&late) && cost(&late) < cost(&base));
     }
 
     #[test]

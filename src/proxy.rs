@@ -202,6 +202,12 @@ async fn handle(State(inner): State<Arc<Inner>>, req: Request) -> Response {
         pending = p;
     }
 
+    if is_messages && let Some(dir) = std::env::var_os("SQUEEZE_DUMP_REQUESTS") {
+        // Debugging aid only: the request bodies as forwarded (conversation
+        // content; never headers, so never credentials).
+        let n = lock(&inner.totals).requests;
+        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}-{n}.json", now_secs())), &out);
+    }
     let url = format!("{}{}", inner.upstream, path_and_query);
     let upstream = inner
         .client

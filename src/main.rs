@@ -298,10 +298,11 @@ struct ReplayArgs {
     /// With --compact-summary: compact only at pauses before a new ticket
     #[arg(long, requires = "compact_summary")]
     compact_tickets_only: bool,
-    /// With --compact-summary: summarize when the next prompt arrives (cache expired,
-    /// history read as uncached input) instead of in the background while it's warm
-    #[arg(long, requires = "compact_summary")]
-    compact_on_arrival: bool,
+    /// With --compact-summary: what the summarizing request reads from cache: `warm` (all
+    /// of it, in the background), `system` (in the background under another cache key for
+    /// messages: only the system prompt and tools), `cold` (when the next prompt arrives)
+    #[arg(long, value_name = "warm|system|cold", default_value = "warm", requires = "compact_summary")]
+    compact_cache: String,
 }
 
 #[derive(Args)]
@@ -876,6 +877,12 @@ fn cmd_cache_sim(a: &ReplayArgs, files: &[PathBuf]) -> Result<()> {
     if a.read_price.is_some_and(|r| !(r > 0.0 && r <= 1.0)) || !(0.0..).contains(&a.placeholder) {
         bail!("--read-price must be above 0 and at most 1, and --placeholder at least 0");
     }
+    let summary_cache = match a.compact_cache.as_str() {
+        "warm" => cachesim::SummaryCache::Warm,
+        "system" => cachesim::SummaryCache::SystemOnly,
+        "cold" => cachesim::SummaryCache::Cold,
+        other => bail!("--compact-cache must be warm, system or cold, not {other:?}"),
+    };
     let cfg = SimConfig {
         regime: a.regime,
         read_price: a.read_price,
@@ -892,7 +899,7 @@ fn cmd_cache_sim(a: &ReplayArgs, files: &[PathBuf]) -> Result<()> {
             thinking: a.compact_thinking,
             reread: a.compact_reread,
             tickets_only: a.compact_tickets_only,
-            on_arrival: a.compact_on_arrival,
+            cache: summary_cache,
         }),
     };
     let sim = cachesim::simulate_files(files, &cfg)?;
