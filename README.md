@@ -357,7 +357,8 @@ refactoring tickets) the way SessionBench does:
   direct API request (adaptive thinking, medium effort, as `claude -p` sends).
   The ticket and diff, which every item shares, are cached once and read by the
   others. Re-judging one scapy session this way gave the same verdict on all 77
-  items, for $0.69 instead of $5.08. Other auth keeps `claude -p`.
+  items, for $0.69 instead of $5.08. The grafana_go session's 51 items cost
+  $1.11. Other auth keeps `claude -p`.
 
 Setup, once:
 
@@ -529,6 +530,30 @@ the same setup and the session-5 build (`--compact-pauses --compact-warm
     request correctly after a mid-ticket summary.
 - **Subagents.** One subagent ran. As designed, squeeze neither summarized it
   nor kept it warm.
+
+**SWE-Atlas grafana_go** (SessionBench's Go bundle, where Fermat does worst),
+one session with the same setup and build:
+
+| Session | squeeze | Same session without squeeze | Ratio | Reward |
+|---|---|---|---|---|
+| 1 | $4.47 | $8.04 | 0.556 | 1.000 |
+
+- **Cost.** The $4.47 is $4.15 of Claude Code's requests, plus $0.33 for three
+  summaries and three keep-warm requests. Without the summary written after
+  the last ticket, the ratio is 0.546. Fermat reports 0.66x on this bundle.
+- **Why the ratio is higher here.** This session had fewer cold moments.
+  Without squeeze, five requests after the first would have rewritten the whole
+  history: $2.92, or 36% of the $8.04. squeeze paid $0.47 for them. Two
+  came after ticket pauses that squeeze summarized. Two came after `go test`
+  runs of 4–6 minutes, which keep-warm requests covered. The rest of the cost
+  is warm requests, which squeeze only shortens. The last ticket ran 46
+  requests without a pause.
+- **Quality.** All five tickets scored 1.000 on both hidden tests and rubric
+  (51 rubric items). SessionBench reports 0.824 for vanilla and 0.889 for
+  Fermat on this bundle, from a different setup.
+- **Across the three bundles**, squeeze cost $44.11 against $93.16 for the same
+  sessions without it (0.474). By bundle, squeeze measures 0.471, 0.465 and
+  0.556. Fermat reports 0.49x, 0.50x and 0.66x, and 0.53x overall.
 
 ### Hook mode and MCP tools on a subscription
 
