@@ -284,6 +284,9 @@ pub struct AtlasCtx<'a> {
     pub dns: Vec<String>,
     /// Judge all rubric items in one call instead of one call per item.
     pub judge_batch: bool,
+    /// Judge one item per direct API request with the shared prefix cached
+    /// (`--auth api-key` with a plain API key); `None` keeps `claude -p`.
+    pub judge_api: Option<ApiJudge>,
     /// Skip grading during the session (run `--regrade` afterwards): grading
     /// takes 10-20 minutes per ticket and doesn't affect the agent.
     pub defer_grading: bool,
@@ -1044,6 +1047,127 @@ fn rubric_status(reply: &Value, index: usize) -> Option<String> {
     Some(item.get("status")?.as_str()?.trim().to_uppercase())
 }
 
+/// The judge's user prompt in two parts: the text before the criterion (the
+/// same for every item) and a function giving the rest for one criterion.
+/// `prefix + rest(title)` is exactly what `py_format` gives with that title.
+fn split_at_title(template: &str, problem: &str, patch: &str) -> (String, impl Fn(&str) -> String) {
+    const MARK: &str = "\u{0}squeeze-rubric-title\u{0}";
+    let marked = py_format(template, &[("problem_statement", problem), ("model_answer", patch), ("title", MARK)]);
+    let (prefix, rest) = match marked.split_once(MARK) {
+        Some((p, r)) => (p.to_string(), format!("{MARK}{r}")),
+        None => (marked, String::new()),
+    };
+    (prefix, move |title: &str| rest.replace(MARK, title))
+}
+
+/// The rubric judge as direct Messages API requests, on the API key that
+/// `--auth api-key` bills anyway. Through `claude -p`, every item wrote the
+/// whole ticket and diff to the cache again and never read it back.
+pub struct ApiJudge {
+    base_url: String,
+    api_key: String,
+}
+
+impl std::fmt::Debug for ApiJudge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiJudge").field("base_url", &self.base_url).field("api_key", &"<redacted>").finish()
+    }
+}
+
+/// Room for adaptive thinking plus a one-item rating (about 200 tokens).
+const JUDGE_MAX_TOKENS: u32 = 16_000;
+const JUDGE_RETRY_PAUSE: Duration = if cfg!(test) { Duration::ZERO } else { Duration::from_secs(10) };
+
+impl ApiJudge {
+    /// A plain API key in ANTHROPIC_API_KEY. Not an OAuth token, and not with
+    /// ANTHROPIC_AUTH_TOKEN set (a gateway): those keep the `claude -p` route.
+    pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        if get("ANTHROPIC_AUTH_TOKEN").is_some_and(|v| !v.trim().is_empty()) {
+            return None;
+        }
+        let api_key = get("ANTHROPIC_API_KEY")?.trim().to_string();
+        if api_key.is_empty() || crate::auth::is_oauth_token(&api_key) {
+            return None;
+        }
+        let base_url = get("ANTHROPIC_BASE_URL")
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| crate::proxy::DEFAULT_UPSTREAM.to_string());
+        Some(Self { base_url, api_key })
+    }
+
+    /// One rating, with the settings `claude -p` uses for the judge (adaptive
+    /// thinking at medium effort, no tools). The user message is `prefix`,
+    /// marked for caching, then `rest`. Returns the reply's text and usage.
+    async fn rate(
+        &self,
+        client: &reqwest::Client,
+        model: &str,
+        system: &str,
+        prefix: &str,
+        rest: &str,
+    ) -> Result<(String, crate::sse::Usage)> {
+        let mut content = vec![json!({ "type": "text", "text": prefix, "cache_control": { "type": "ephemeral" } })];
+        if !rest.is_empty() {
+            content.push(json!({ "type": "text", "text": rest }));
+        }
+        let body = serde_json::to_vec(&json!({
+            "model": model,
+            "max_tokens": JUDGE_MAX_TOKENS,
+            "system": system,
+            "messages": [{ "role": "user", "content": content }],
+            "thinking": { "type": "adaptive" },
+            "output_config": { "effort": "medium" },
+        }))?;
+        let mut attempt = 0;
+        loop {
+            let sent = client
+                .post(format!("{}/v1/messages", self.base_url))
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .header("user-agent", concat!("squeeze/", env!("CARGO_PKG_VERSION")))
+                .body(body.clone())
+                .send()
+                .await;
+            let (status, err) = match sent {
+                Ok(resp) if resp.status().is_success() => {
+                    let bytes = resp.bytes().await?;
+                    let v: Value = serde_json::from_slice(&bytes).context("judge reply is not JSON")?;
+                    let text: String = v["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|b| b["type"] == "text")
+                        .filter_map(|b| b["text"].as_str())
+                        .collect();
+                    let mut tap = crate::sse::UsageTap::new(false);
+                    tap.feed(&bytes);
+                    return Ok((text, tap.finish().unwrap_or_default()));
+                }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let text = resp.text().await.unwrap_or_default();
+                    let err = crate::util::truncate_chars(text.trim(), 300);
+                    if status != 429 && status < 500 {
+                        bail!("judge request failed: HTTP {status}: {err}");
+                    }
+                    (status, err)
+                }
+                Err(e) => (0, e.to_string()),
+            };
+            if attempt == 3 {
+                if status == 429 {
+                    return Err(bench::LimitReached(err).into());
+                }
+                bail!("judge request failed after {attempt} retries: HTTP {status}: {err}");
+            }
+            attempt += 1;
+            tokio::time::sleep(JUDGE_RETRY_PAUSE * attempt).await;
+        }
+    }
+}
+
 async fn judge(
     ctx: &AtlasCtx<'_>,
     model: Option<&str>,
@@ -1079,6 +1203,21 @@ async fn judge(
         let r = bench::helper(ctx.host, tdir, &bench::helper_args(model, &task.system_prompt), &user, 1800).await?;
         helpers.add_result(&r);
         statuses = (0..items.len()).map(|i| rubric_status(&r, i)).collect();
+    } else if let Some(api) = &ctx.judge_api {
+        // Every item's prompt is the same ticket and diff up to the criterion,
+        // so that part is cached by the first request and read by the rest.
+        let (prefix, rest) = split_at_title(&task.user_template, &task.problem, patch);
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(900)).build()?;
+        for r in &items {
+            let started = std::time::Instant::now();
+            let (text, usage) = api.rate(&client, model, &task.system_prompt, &prefix, &rest(&title(r))).await?;
+            let usd = crate::util::usage_usd(model, &usage).unwrap_or_else(|| {
+                tracing::warn!("no price for {model:?}: the judge's cost is left out");
+                0.0
+            });
+            helpers.add_api(&usage, usd, started.elapsed().as_millis() as u64);
+            statuses.push(rubric_status(&json!({ "result": text }), 0));
+        }
     } else {
         for r in &items {
             let t = title(r);
@@ -1198,6 +1337,7 @@ mod tests {
             memory: "1g".into(),
             dns: Vec::new(),
             judge_batch: false,
+            judge_api: None,
             defer_grading: true,
             runs_dir: PathBuf::new(),
             openings_dir: PathBuf::new(),
@@ -1239,6 +1379,154 @@ mod tests {
         let t = "# Prompt\n{problem_statement}\n\n# Response\n{model_answer}\n\n#Rubric\n{{\n  \"rubric_statement\": {title}\n}}";
         let out = py_format(t, &[("problem_statement", "P"), ("model_answer", "fn x() { y{{z}} }"), ("title", "T")]);
         assert_eq!(out, "# Prompt\nP\n\n# Response\nfn x() { y{{z}} }\n\n#Rubric\n{\n  \"rubric_statement\": T\n}");
+    }
+
+    const TEMPLATE: &str = "# Prompt\n{problem_statement}\n\n# Response\n{model_answer}\n\n#Rubric Criteria\n{{\n  \"rubric_statement\": {title}\n}}";
+
+    #[test]
+    fn the_judge_prompt_splits_at_the_criterion() {
+        let patch = "fn x() { y{{z}} } {title}";
+        let (prefix, rest) = split_at_title(TEMPLATE, "P", patch);
+        for t in ["T one", "T two"] {
+            let whole = py_format(TEMPLATE, &[("problem_statement", "P"), ("model_answer", patch), ("title", t)]);
+            assert_eq!(format!("{prefix}{}", rest(t)), whole, "the split loses or changes nothing");
+        }
+        assert!(prefix.ends_with("\"rubric_statement\": ") && prefix.contains(patch), "{prefix:?}");
+        let (whole, rest) = split_at_title("# Prompt\n{problem_statement}", "P", patch);
+        assert_eq!((whole.as_str(), rest("T").as_str()), ("# Prompt\nP", ""), "no criterion slot: one part");
+    }
+
+    #[test]
+    fn the_api_judge_takes_only_a_plain_api_key() {
+        let env = |vars: &'static [(&str, &str)]| {
+            move |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        let j = ApiJudge::from_env(env(&[("ANTHROPIC_API_KEY", "sk-ant-api03-x")])).expect("a plain key");
+        assert_eq!(j.base_url, "https://api.anthropic.com");
+        let j = ApiJudge::from_env(env(&[("ANTHROPIC_API_KEY", "k"), ("ANTHROPIC_BASE_URL", "http://h:1/")])).unwrap();
+        assert_eq!(j.base_url, "http://h:1");
+        assert!(!format!("{j:?}").contains("\"k\""), "the key stays out of Debug");
+        assert!(ApiJudge::from_env(env(&[("ANTHROPIC_API_KEY", "sk-ant-oat01-x")])).is_none(), "no OAuth");
+        assert!(ApiJudge::from_env(env(&[("ANTHROPIC_API_KEY", "k"), ("ANTHROPIC_AUTH_TOKEN", "gw")])).is_none());
+        assert!(ApiJudge::from_env(env(&[])).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_api_judge_caches_the_ticket_and_diff_and_scores_each_item() {
+        use axum::http::HeaderMap;
+        use std::sync::{Arc, Mutex};
+        // A mock Messages API: overloaded once, then a YES rating per request.
+        let seen: Arc<Mutex<Vec<(HeaderMap, Value)>>> = Default::default();
+        let log = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let log = log.clone();
+                async move {
+                    let mut log = log.lock().unwrap();
+                    log.push((headers, serde_json::from_slice(&body).unwrap()));
+                    if log.len() == 1 {
+                        return (axum::http::StatusCode::from_u16(529).unwrap(), "overloaded".to_string());
+                    }
+                    let first = log.len() == 2;
+                    let reply = json!({
+                        "model": "claude-opus-5-5", "stop_reason": "end_turn",
+                        "content": [
+                            { "type": "thinking", "thinking": "", "signature": "s" },
+                            { "type": "text", "text": "{\"ratings\": [{\"status\": \"YES\", \"justification\": \"j\"}]}" }
+                        ],
+                        "usage": { "input_tokens": 30, "output_tokens": 200,
+                            "cache_creation_input_tokens": if first { 9000 } else { 0 },
+                            "cache_read_input_tokens": if first { 0 } else { 9000 } }
+                    });
+                    (axum::http::StatusCode::OK, reply.to_string())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let host = bench::Context {
+            claude_bin: "/nonexistent/claude".into(),
+            exe: PathBuf::from("/bin/squeeze"),
+            store_root: PathBuf::from("/tmp/store"),
+            auth: Auth::ApiKey,
+            proxy_urls: BTreeMap::new(),
+            model_override: None,
+            include_user_settings: false,
+            keep_dirs: false,
+        };
+        let vars = [
+            ("ANTHROPIC_API_KEY".to_string(), "sk-ant-api03-test".to_string()),
+            ("ANTHROPIC_BASE_URL".to_string(), format!("http://{addr}")),
+        ];
+        let ctx = AtlasCtx {
+            host: &host,
+            runtime: Runtime::Apple,
+            root: PathBuf::new(),
+            claude_linux: PathBuf::new(),
+            squeeze_linux: PathBuf::new(),
+            token_env_file: None,
+            api_key_env_file: None,
+            api_key_all_arms: false,
+            openings_lock: Default::default(),
+            proxy_urls: BTreeMap::new(),
+            agent_env: Vec::new(),
+            cache_ttl: CacheTtl::Client,
+            cpus: 1,
+            memory: "1g".into(),
+            dns: Vec::new(),
+            judge_batch: false,
+            judge_api: ApiJudge::from_env(|k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())),
+            defer_grading: true,
+            runs_dir: PathBuf::new(),
+            openings_dir: PathBuf::new(),
+        };
+        let rubric = |title: &str, kind: &str| json!({ "title": title, "annotations": { "type": kind } });
+        let task = Task {
+            id: "t".into(),
+            dir: PathBuf::new(),
+            image: String::new(),
+            instruction: String::new(),
+            problem: "Refactor X.".into(),
+            rubrics: vec![
+                rubric("Overall intent", "high level intent"),
+                rubric("Keeps the API", "positive"),
+                rubric("Adds a global", "negative hli verifier"),
+            ],
+            system_prompt: "Grade one criterion.".into(),
+            user_template: TEMPLATE.into(),
+        };
+        let tdir = tempfile::tempdir().unwrap();
+        let mut helpers = Usage::default();
+        let score =
+            judge(&ctx, Some("claude-opus-5-5"), &task, "diff --git a/x b/x", tdir.path(), &mut helpers).await.unwrap();
+        assert_eq!(score, Some(0.5), "YES passes the positive item and fails the negative one");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "the 529 is retried; the high-level-intent item isn't judged");
+        let (prefix, rest) = split_at_title(TEMPLATE, &task.problem, "diff --git a/x b/x");
+        for ((headers, body), title) in seen[1..].iter().zip(["Keeps the API", "Adds a global"]) {
+            assert_eq!(headers["x-api-key"], "sk-ant-api03-test");
+            assert!(headers.get("anthropic-beta").is_none() && headers.get("authorization").is_none());
+            assert!(!headers["user-agent"].to_str().unwrap().contains("claude"), "squeeze's own client");
+            assert_eq!(body["system"], "Grade one criterion.");
+            assert_eq!(body["thinking"], json!({ "type": "adaptive" }));
+            assert_eq!(body["output_config"], json!({ "effort": "medium" }));
+            assert!(body.get("tools").is_none() && body.get("stream").is_none());
+            let content = &body["messages"][0]["content"];
+            assert_eq!(content[0], json!({ "type": "text", "text": prefix, "cache_control": { "type": "ephemeral" } }));
+            assert_eq!(content[1], json!({ "type": "text", "text": rest(title) }));
+        }
+        assert_eq!(
+            (helpers.invocations, helpers.cache_creation_input_tokens, helpers.cache_read_input_tokens),
+            (2, 9000, 9000)
+        );
+        let want = 4.0 * (60.0 + 1.25 * 9000.0 + 0.05 * 9000.0 + 5.0 * 400.0) / 1e6;
+        assert!((helpers.cost_usd - want).abs() < 1e-9, "{} vs {want}", helpers.cost_usd);
+        let saved: Value = serde_json::from_slice(&std::fs::read(tdir.path().join("rubric.json")).unwrap()).unwrap();
+        assert_eq!(saved.as_array().unwrap().len(), 2);
     }
 
     #[test]

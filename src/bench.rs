@@ -379,6 +379,19 @@ impl Usage {
         }
     }
 
+    /// One direct API request (not a `claude -p` process): its tokens, and its
+    /// cost from list prices (`usd`).
+    pub(crate) fn add_api(&mut self, u: &crate::sse::Usage, usd: f64, duration_ms: u64) {
+        self.cost_usd += usd;
+        self.turns += 1;
+        self.invocations += 1;
+        self.duration_ms += duration_ms;
+        self.input_tokens += u.input_tokens;
+        self.cache_creation_input_tokens += u.cache_creation_input_tokens;
+        self.cache_read_input_tokens += u.cache_read_input_tokens;
+        self.output_tokens += u.output_tokens;
+    }
+
     pub(crate) fn add_result(&mut self, r: &Value) {
         let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
         self.cost_usd += r.get("total_cost_usd").and_then(Value::as_f64).unwrap_or(0.0);

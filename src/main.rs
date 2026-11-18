@@ -1214,6 +1214,12 @@ async fn cmd_bench(a: BenchArgs) -> Result<()> {
     Ok(())
 }
 
+/// The judge's direct API route when the run bills an API key (see
+/// [`squeeze::atlas::ApiJudge`]); a subscription run keeps `claude -p`.
+fn judge_api(auth: bench::Auth) -> Option<squeeze::atlas::ApiJudge> {
+    (auth == bench::Auth::ApiKey).then(|| squeeze::atlas::ApiJudge::from_env(|k| std::env::var(k).ok())).flatten()
+}
+
 fn host_claude_version(bin: &str) -> Option<String> {
     let out = std::process::Command::new(bin).arg("--version").output().ok()?;
     String::from_utf8_lossy(&out.stdout).split_whitespace().next().map(str::to_string)
@@ -1328,6 +1334,7 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
             memory: a.memory.clone(),
             dns: a.dns.clone(),
             judge_batch: a.judge_batch,
+            judge_api: judge_api(auth),
             defer_grading: false,
             openings_dir: runs_dir.join("openings"),
             runs_dir,
@@ -1402,7 +1409,11 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
         a.model.as_deref().or(d.model.as_deref()).unwrap_or("Claude Code default"),
         d.usersim_model.as_deref().unwrap_or("off"),
         d.judge_model.as_deref().unwrap_or("off"),
-        if a.judge_batch { " (batched)" } else { " (one call per rubric item)" },
+        match (a.judge_batch, judge_api(auth).is_some()) {
+            (true, _) => " (batched)",
+            (false, true) => " (one direct API request per rubric item, the shared ticket and diff cached)",
+            (false, false) => " (one call per rubric item)",
+        },
     );
     eprintln!(
         "Auth: {}. Unmodified Claude Code {} runs inside each task container; squeeze adds only a hook and MCP tools.",
@@ -1503,6 +1514,7 @@ async fn cmd_bench_atlas(a: AtlasArgs) -> Result<()> {
         memory: a.memory.clone(),
         dns: a.dns.clone(),
         judge_batch: a.judge_batch,
+        judge_api: judge_api(auth),
         defer_grading: a.defer_grading,
         openings_dir: a.openings.clone().unwrap_or_else(|| runs_dir.join("openings")),
         runs_dir,
