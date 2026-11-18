@@ -119,9 +119,10 @@ struct CompressFlags {
     #[arg(long, requires = "compact_pauses")]
     compact_warm: bool,
     /// With --compact-warm: while a tool call runs past the prompt cache's TTL (a long
-    /// test run, a subagent), send the request it answered again for one output token a
-    /// minute before the cache would expire (at most 6 times), so Claude Code's next
-    /// request reads the conversation from the cache instead of writing it again
+    /// test run, a subagent), or a pause lasts after a turn too short to summarize, send
+    /// the request it answered again for one output token a minute before the cache would
+    /// expire (at most 6 times), so Claude Code's next request reads the conversation from
+    /// the cache instead of writing it again
     #[arg(long, requires = "compact_warm")]
     keep_warm: bool,
     /// With --context-edits: also clear thinking from before the latest human prompt.

@@ -561,6 +561,16 @@ fn thread_tick(inner: &Inner, body: &Value, headers: &HeaderMap, is_messages: bo
     drop(threads);
     let generation = {
         let mut generations = lock(&inner.generations);
+        // The conversation's first tool call renamed its thread (see
+        // `thread_key`): what the request before it left waiting (a keep-warm)
+        // waits under the old name, and ends here as it would on that thread.
+        if anchor.is_some()
+            && !generations.contains_key(&key)
+            && let Some(before) = thread_key(body, headers, None)
+            && let Some(g) = generations.get_mut(&before)
+        {
+            *g += 1;
+        }
         let g = generations.entry(key.clone()).or_default();
         *g += 1;
         *g
@@ -572,7 +582,7 @@ fn thread_tick(inner: &Inner, body: &Value, headers: &HeaderMap, is_messages: bo
 /// its first tool_use id (with the agent) names the thread: unlike the session
 /// id, the model or the first message, it survives `--resume`, a model switch
 /// and Claude Code moving its cache marker off the first message. Until then,
-/// the session and its first message do.
+/// the session and its first message (without cache markers) do.
 fn thread_key(body: &Value, headers: &HeaderMap, anchor: Option<&str>) -> Option<String> {
     let agent = header_str(headers, "x-claude-code-agent-id");
     let agent = agent.as_deref().unwrap_or("main");
@@ -581,8 +591,20 @@ fn thread_key(body: &Value, headers: &HeaderMap, anchor: Option<&str>) -> Option
     }
     let session = header_str(headers, "x-claude-code-session-id")?;
     let model = body.get("model").and_then(Value::as_str).unwrap_or("");
-    let first = body.get("messages").and_then(|m| m.get(0)).map(Value::to_string).unwrap_or_default();
+    let first = body.get("messages").and_then(|m| m.get(0)).map(unmarked).unwrap_or_default();
     Some(short_hash(&[&session, agent, model, &first]))
+}
+
+/// A message as text without its cache markers, which move along the
+/// conversation as it grows.
+fn unmarked(message: &Value) -> String {
+    let mut m = message.clone();
+    if let Some(blocks) = m.get_mut("content").and_then(Value::as_array_mut) {
+        for block in blocks.iter_mut().filter_map(Value::as_object_mut) {
+            block.remove("cache_control");
+        }
+    }
+    m.to_string()
 }
 
 /// A thread's saved state. A thread that's new under its key but whose first
@@ -747,12 +769,13 @@ impl Pending {
     }
 }
 
-/// While the tool call a response asked for runs, send the request it answered
-/// again, for one output token ([`compact::keep_warm_request`]), shortly
-/// before that request's cache would expire: a cache read that keeps the
-/// conversation cached for Claude Code's next request, which would otherwise
-/// write it all again. Stops at the thread's next request, after a failed
-/// request, or after [`compact::KEEP_WARM_MAX_PINGS`], dropping the credentials.
+/// While the tool call a response asked for runs (or the pause after a turn
+/// too short to summarize lasts), send the request it answered again, for one
+/// output token ([`compact::keep_warm_request`]), shortly before that
+/// request's cache would expire: a cache read that keeps the conversation
+/// cached for Claude Code's next request, which would otherwise write it all
+/// again. Stops at the thread's next request, after a failed request, or after
+/// [`compact::KEEP_WARM_MAX_PINGS`], dropping the credentials.
 async fn keep_warm(
     inner: Arc<Inner>,
     cfg: CompactConfig,
@@ -848,13 +871,18 @@ async fn compact_later(
     started: u64,
     job: CompactJob,
 ) {
-    let CompactJob { generation, covered, prefix_hash, forwarded, credentials, bound } = job;
-    let (Some(forwarded), Some(credentials)) = (forwarded, credentials) else { return };
-    let Ok(body) = serde_json::from_slice::<Value>(&forwarded) else { return };
+    let Some(body) = job.forwarded.as_deref().and_then(|f| serde_json::from_slice::<Value>(f).ok()) else { return };
     let conversation = body.get("messages").map_or(0, |m| m.to_string().len());
     if approx_tokens(conversation) < cfg.min_tokens as f64 {
+        // Too short for a summary to pay for itself. A keep-warm request costs
+        // a 25th of rewriting it after the pause, so keep it cached instead.
+        if cfg.keep_warm {
+            keep_warm(inner, cfg, key, session, model, started, job).await;
+        }
         return;
     }
+    let CompactJob { generation, covered, prefix_hash, credentials, bound, .. } = job;
+    let Some(credentials) = credentials else { return };
     let idle = cfg
         .idle_secs
         .unwrap_or_else(|| transform::message_cache_ttl_secs(&body).saturating_sub(compact::IDLE_LEAD_SECS));

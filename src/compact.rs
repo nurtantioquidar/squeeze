@@ -31,7 +31,8 @@
 //! conversation: shortly before the cache would expire, the proxy sends the
 //! request the tool call answered again, for one output token
 //! ([`keep_warm_request`]), which reads the conversation from the cache and so
-//! keeps it there for Claude Code's next request.
+//! keeps it there for Claude Code's next request. So does the pause after a
+//! turn whose conversation is too short to be worth summarizing.
 
 use crate::auth;
 use crate::util::short_hash;
@@ -52,7 +53,8 @@ pub struct CompactConfig {
     /// summarize from the cache ([`warm_summary_request`]).
     pub warm: bool,
     /// `--keep-warm` (with `warm`): keep the conversation cached while a tool
-    /// call runs past the cache's TTL ([`keep_warm_request`]).
+    /// call runs past the cache's TTL, and through a pause after a turn too
+    /// short to summarize ([`keep_warm_request`]).
     pub keep_warm: bool,
 }
 
@@ -66,8 +68,8 @@ impl Default for CompactConfig {
 /// so it still reads the system prompt and tools from it; so does a keep-warm
 /// request.
 pub const IDLE_LEAD_SECS: u64 = 60;
-/// Keep-warm requests for one tool call at most (about 24 minutes at the
-/// 5-minute TTL). Each costs a cache read of the conversation, a 25th of
+/// Keep-warm requests for one tool call or pause at most (about 24 minutes at
+/// the 5-minute TTL). Each costs a cache read of the conversation, a 25th of
 /// rewriting it, so a tool call that never returns costs at most about a
 /// quarter of the rewrite the requests are there to avoid.
 pub const KEEP_WARM_MAX_PINGS: u32 = 6;

@@ -1036,7 +1036,17 @@ async fn warm_compaction_forwards_without_claude_codes_beta_and_summarizes_from_
 /// when `keep_warm`) in front of a mock that answers every turn with a tool
 /// call, and a non-streaming request with one output token.
 async fn keep_warm_proxy(clock: &Arc<FakeClock>, store_dir: &Path, keep_warm: bool) -> (common::Mock, String) {
-    let mock = common::start(Arc::new(|r: &common::Recorded| {
+    keep_warm_proxy_with(clock, store_dir, keep_warm, "tool_use").await
+}
+
+/// [`keep_warm_proxy`], ending every turn with `stop` (a tool call or a reply).
+async fn keep_warm_proxy_with(
+    clock: &Arc<FakeClock>,
+    store_dir: &Path,
+    keep_warm: bool,
+    stop: &'static str,
+) -> (common::Mock, String) {
+    let mock = common::start(Arc::new(move |r: &common::Recorded| {
         if r.json()["stream"] == false {
             return Reply::Json(
                 200,
@@ -1047,9 +1057,13 @@ async fn keep_warm_proxy(clock: &Arc<FakeClock>, store_dir: &Path, keep_warm: bo
         }
         let usage = json!({ "input_tokens": 3, "cache_creation_input_tokens": 1_000,
                             "cache_read_input_tokens": 40_000, "output_tokens": 50 });
-        let call =
-            json!({ "type": "tool_use", "id": "toolu_long", "name": "Bash", "input": { "command": "make test" } });
-        Reply::Sse(common::sse_message(0, "mock-model", &[call], "tool_use", usage, json!({})))
+        let block = match stop {
+            "tool_use" => {
+                json!({ "type": "tool_use", "id": "toolu_long", "name": "Bash", "input": { "command": "make test" } })
+            }
+            _ => json!({ "type": "text", "text": "Done." }),
+        };
+        Reply::Sse(common::sse_message(0, "mock-model", &[block], stop, usage, json!({})))
     }))
     .await;
     let compact = squeeze::compact::CompactConfig { idle_secs: Some(1), min_tokens: 5_000, warm: true, keep_warm };
@@ -1106,6 +1120,82 @@ async fn keep_warm_resends_the_request_while_its_tool_call_runs() {
     tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
     let first = summarizing(&mock).into_iter().filter(|r| r.json()["messages"].as_array().unwrap().len() == n).count();
     assert_eq!(first, 1, "no more for the first request once the next one came");
+}
+
+/// A conversation's opening request, before its first tool call: one prompt.
+fn opening(marked: bool) -> Value {
+    let mut text = json!({ "type": "text", "text": "look around" });
+    if marked {
+        text["cache_control"] = json!({ "type": "ephemeral" });
+    }
+    json!({ "model": "claude-opus-5-5", "max_tokens": 100, "stream": true,
+            "messages": [{ "role": "user", "content": [text] }] })
+}
+
+/// Send `body` at fake time `at` in session s1, as Claude Code does.
+async fn send_in_session(url: &str, clock: &FakeClock, at: u64, body: &Value) {
+    clock.set(at);
+    let req = client().post(format!("{url}{MESSAGES}?beta=true")).header("x-api-key", "sk-ant-api03-test");
+    let req = req.header("anthropic-beta", CM_BETAS).header("x-claude-code-session-id", "s1");
+    req.json(body).send().await.unwrap().text().await.unwrap();
+    // Let the stream finalizer settle the response.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+}
+
+fn keep_warm_requests(mock: &common::Mock, messages: usize) -> usize {
+    summarizing(mock)
+        .iter()
+        .filter(|r| r.json()["max_tokens"] == 1 && r.json()["messages"].as_array().unwrap().len() == messages)
+        .count()
+}
+
+#[tokio::test]
+async fn keep_warm_for_the_opening_request_ends_when_its_tool_call_returns() {
+    // The opening request has no tool call yet, so its thread is named by the
+    // session and prompt; the next one carries the first tool call, which
+    // names the thread from then on. Its keep-warm must end there all the same.
+    let (clock, dir) = (Arc::new(FakeClock::default()), tempfile::tempdir().unwrap());
+    let (mock, url) = keep_warm_proxy(&clock, dir.path(), true).await;
+    send_in_session(&url, &clock, T0, &opening(true)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+    assert_eq!(keep_warm_requests(&mock, 1), 1, "the opening request kept warm while its tool call runs");
+
+    // The tool call returns (Claude Code's cache marker has moved to the end).
+    let mut next = opening(false);
+    next["messages"].as_array_mut().unwrap().extend(cat_loop("toolu_long"));
+    let n = next["messages"].as_array().unwrap().len();
+    next["messages"][n - 1]["content"][0]["cache_control"] = json!({ "type": "ephemeral" });
+    send_in_session(&url, &clock, T0 + 400, &next).await;
+    tokio::time::sleep(std::time::Duration::from_millis(2600)).await;
+    assert_eq!(keep_warm_requests(&mock, 1), 1, "none for the opening request once its tool call returned");
+    assert!(keep_warm_requests(&mock, n) >= 1, "the next request's own tool call is kept warm in turn");
+}
+
+#[tokio::test]
+async fn a_turn_too_short_to_summarize_is_kept_warm_through_the_pause() {
+    let (clock, dir) = (Arc::new(FakeClock::default()), tempfile::tempdir().unwrap());
+    let (mock, url) = keep_warm_proxy_with(&clock, dir.path(), true, "end_turn").await;
+    // Far under min_tokens: no summary, a keep-warm request instead.
+    send_in_session(&url, &clock, T0, &opening(true)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+    let own = summarizing(&mock);
+    assert_eq!(own.len(), 1);
+    let mut expect = opening(true);
+    expect["stream"] = json!(false);
+    expect["max_tokens"] = json!(1);
+    assert_eq!(own[0].json(), expect, "the turn's request for one token, not a summary");
+    let recs = Store::open(dir.path()).unwrap().records().unwrap();
+    assert_eq!(recs.iter().filter(|r| r.get("keep_warm").is_some()).count(), 1);
+    assert_eq!(recs.iter().filter(|r| r.get("compaction").is_some()).count(), 0);
+
+    // A turn long enough to summarize is summarized, not kept warm.
+    let (clock, dir) = (Arc::new(FakeClock::default()), tempfile::tempdir().unwrap());
+    let (mock, url) = keep_warm_proxy_with(&clock, dir.path(), true, "end_turn").await;
+    cm_send(&url, &mock, &clock, T0, MESSAGES, &cm_conversation(6, 2)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+    let own = summarizing(&mock);
+    assert_eq!(own.len(), 1);
+    assert_ne!(own[0].json()["max_tokens"], 1, "a summary");
 }
 
 #[tokio::test]
