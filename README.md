@@ -17,7 +17,7 @@ Everything runs on your machine.
 |---|---|---|
 | How | Claude Code's documented [`PostToolUse` hook](https://code.claude.com/docs/en/hooks) rewrites tool output before Claude sees it | A local proxy on `ANTHROPIC_BASE_URL` rewrites `tool_result` text in API requests |
 | Credentials | **Any**: subscription login, `claude setup-token`, API key. squeeze never sees credentials or API traffic | **API key or gateway credential only** |
-| Extras | | Replaces repeated identical outputs with references; experimental cold-cache pruning and server-side context editing |
+| Extras | | Replaces repeated identical outputs with references; summarizes the conversation at pauses longer than the prompt cache lasts; experimental cold-cache pruning and server-side context editing |
 
 Anthropic's terms do not allow third-party tools to route or intermediate Claude
 subscription (Free/Pro/Max/Ultra) credentials
@@ -156,6 +156,70 @@ squeeze run --proxy
 squeeze proxy --port 8787            # standalone, for IDE extensions or scripts
 ```
 
+**Compaction at pauses** (`--compact-pauses`, proxy mode, API keys only). On
+an API key, Claude Code's prompt cache lasts 5 minutes. After a longer pause
+(reading a diff, a meeting, a review), the next request writes the whole
+conversation to the cache again, at 1.25x the input price. Late in a long
+session that is 100k–300k tokens, or $0.50–1.50 per pause on Opus 5.5.
+
+```sh
+squeeze run --proxy --compact-pauses --compact-warm --keep-warm
+squeeze proxy --compact-pauses --compact-warm --keep-warm    # standalone
+```
+
+When Claude Code finishes a turn and the conversation then sits idle until a
+minute before its cache would expire, the proxy has the model summarize it in
+the background. From the next request on, the proxy sends the summary in place
+of everything between the first message and the turn's final reply. Claude
+Code's first message (its instructions and project context), its system-role
+messages and the final reply go out unchanged, and Claude Code's own transcript
+keeps the full history. If you come back sooner, nothing changes.
+
+- **`--compact-pauses`** turns this on. On its own, the summarizing request
+  can't use Claude Code's cached conversation: Claude Code's requests carry its
+  `claude-code-20250219` beta, which keeps their cache entries apart. So it
+  pays the full input price for the conversation, about $0.15–0.30 a summary.
+- **`--compact-warm`** forwards Claude Code's requests without that beta.
+  squeeze only removes it; it never adds it to a request of its own. The
+  summarizing request is then Claude Code's last request plus the instruction,
+  and reads the conversation from the cache: about $0.09–0.13 a summary on
+  Opus 5.5, mostly for the summary's own output. What the beta changes on
+  Anthropic's side isn't documented. Claude Code worked normally without it in
+  our runs: all 748 requests of five benchmark sessions succeeded.
+- **`--keep-warm`** (with `--compact-warm`) covers the waits a summary can't:
+  a tool call that runs longer than the cache lasts (a long test suite), and a
+  pause after a turn too short to summarize. A minute before the cache would
+  expire, the proxy sends the last request again for one output token. That
+  reads the conversation from the cache, about a 25th of the cost of writing
+  it again ($0.01–0.06 on Opus 5.5), at most 6 times per wait.
+
+A summary keeps every user request in order (the latest one quoted in full,
+constraints word for word), the state of the work, and the files read or
+changed. For code it keeps exact names, signatures, user-visible strings and
+what calls what. It also keeps the commands run with their latest results,
+decisions and next steps. File contents and raw tool output are left out; the
+agent reads them again when it needs them. A summary still holds less than the
+full history: see [Results](#proxy-compaction-on-an-api-key) for what that did
+to quality.
+
+- **What's summarized:** a conversation of at least about 20k tokens. Not a
+  subagent's: its reply ends it.
+- **Credentials:** the proxy's own requests use the API key of the request
+  that ended the turn, held in memory only until then. Subscription
+  credentials never get this far; proxy mode refuses them.
+- **Restarts:** summaries are saved per conversation under
+  `~/.squeeze/threads/`, so a restarted proxy keeps sending them. If Claude
+  Code rewinds or compacts the conversation itself, the summary no longer
+  fits, and the proxy stops sending it.
+- **Cost records:** each request the proxy makes is a line in
+  `~/.squeeze/stats.jsonl` (`compaction` or `keep_warm`), with its usage.
+- **Ending a session:** with `squeeze run`, the proxy stops with Claude Code.
+  A standalone proxy can't tell a finished session from a pause, so it
+  summarizes the last turn too (about $0.10).
+- **A 1-hour cache** (`ENABLE_PROMPT_CACHING_1H=1`): the proxy waits for a
+  minute before that expiry instead.
+- **Doesn't combine with** `--context-edits cold`.
+
 **Server-side context editing** (experimental, `--context-edits cold`, proxy
 mode only). The proxy asks the API to clear old tool results and thinking,
 through the `context_management` field Claude Code already sends. It never
@@ -188,9 +252,10 @@ requests keep reading the history from cache.
   right away if a request is refused. Each line in `~/.squeeze/stats.jsonl`
   records what was asked, what the API cleared and any `breakers` tripped
   (`ctx`).
-- **Status:** off by default. Whether the API's prompt cache holds across
-  these edits as expected still needs a paid probe. It can't be combined with
-  `--prune-cold-cache`.
+- **Status:** off by default. A two-ticket run on an API key confirmed that
+  the API clears what's asked and the cache holds between advances.
+  Compaction at pauses (above) saves far more on the same workload. It can't
+  be combined with `--prune-cold-cache` or `--compact-pauses`.
 - **Estimating it offline:** `squeeze replay --cache-sim <transcripts>`
   rebuilds every request of Claude Code 2.1.317+ transcripts, runs them through
   the proxy's own context-editing logic (unchanged-file refills included;
@@ -235,6 +300,10 @@ It goes beyond that methodology in a few ways:
   - `squeeze-mcp`: tools only
   - `squeeze-proxy`: proxy compression (API key only)
   - `squeeze-proxy-cm`: `squeeze-proxy` plus `--context-edits cold` (API key only)
+  - `squeeze-proxy-cm-inputs`: `squeeze-proxy-cm` plus `--clear-tool-inputs` (API key only)
+  - `squeeze-proxy-compact`: `squeeze-proxy` plus `--compact-pauses` (API key only)
+  - `squeeze-proxy-compact-warm`: plus `--compact-warm` (API key only)
+  - `squeeze-proxy-compact-keepwarm`: plus `--keep-warm` (API key only)
 - **A paired bootstrap 95% CI** on the cost ratio.
 - **Resume after a usage limit.** Rerun the same command and finished sessions
   are skipped.
@@ -378,8 +447,61 @@ Findings from setting this up:
 | `cargo test --test e2e_claude -- --include-ignored` | free | the real `claude` CLI against a scripted local mock API: hook mode, proxy mode with and without context editing (against the emulated API, with 5-minute and 1-hour cache markers), and `squeeze bench` across every arm. Uses a dummy key and an isolated config dir, so nothing reaches Anthropic |
 | `squeeze replay` | free, offline | applies the compression rules to your past transcripts (`~/.claude/projects`) and prices them against the recorded usage |
 | `squeeze replay --cache-sim` | free, offline | replays past requests through `--context-edits cold` and a prompt-cache model, against the same sessions sent unchanged |
+| `squeeze replay --cache-sim --compact-summary TOKENS` | free, offline | the same, modelling compaction at pauses with a summary of that size instead |
 
 ## Results so far
+
+### Proxy compaction on an API key
+
+**SWE-Atlas grafana_ts** (SessionBench's TypeScript bundle: 5 refactoring
+tickets in one resumed session). Opus 5.5 is the agent, the simulated user and
+the judge. Claude Code 2.1.326 runs in the task containers, with the agent on
+an API key (5-minute cache). As in SessionBench, the session pauses 330 s
+before each ticket and before every third user message. The code improved
+between sessions, as noted.
+
+| Session | Build | squeeze | Same session without squeeze | Ratio | Reward |
+|---|---|---|---|---|---|
+| 1 | `--compact-warm` | $5.39 | $10.44 | 0.516 | 0.908 |
+| 2 | same | $6.05 | $12.55 | 0.482 | 0.923 |
+| 3 | plus `--keep-warm` | $6.62 | $13.59 | 0.487 | 0.852 |
+| 4 | keep-warm fixes | $6.14 | $15.71 | 0.391 | 0.879 |
+| 5 | summaries keep exact names and strings | $6.85 | $14.35 | 0.477 | 0.943 |
+| **Mean** | | | | **0.471** | **0.901** |
+
+Three earlier sessions, without `--compact-warm`, measured 0.54–0.55.
+Vanilla's reward for comparison: 0.905 and 0.872 (mean 0.889), from the two
+vanilla sessions below (on a subscription, Claude Code 2.1.317).
+
+- **How the ratio is measured.**
+  - *squeeze:* what the session cost, meaning Claude Code's requests as billed
+    plus the proxy's own summaries and keep-warm requests.
+  - *Same session without squeeze:* every request is rebuilt from Claude Code's
+    transcript with its full history and counted with the API's token-counting
+    endpoint. It is priced at Opus 5.5's rates with a 5-minute cache, with the
+    same output. A request within 300 s of the one before reads that one's
+    prompt from the cache; after a longer gap it writes the whole prompt again.
+  - *Why this way:* holding the session fixed removes run-to-run noise, about
+    30% between the two vanilla sessions here. But it isn't a separate vanilla
+    run.
+- **Where the saving comes from.** Mostly from the pauses. In session 5, the
+  six requests after a pause would have cost $4.99 without squeeze; they cost
+  $0.53 with it. The rest comes from every later request reading a shorter
+  history.
+- **Why it varies.** The ratio depends on how many pauses a session has, and
+  how long its history is by then. It ranged from 0.39 (session 4, which
+  paused more) to 0.52.
+- **Quality.** Within noise of vanilla: a mean of 0.901 against 0.889, with
+  only two vanilla sessions to compare. One effect was traced and fixed.
+  Ticket 5 rewrites a component from ticket 4 after its repository is reset,
+  and its hidden tests check exact labels. Summaries that only described the
+  code lost those labels, and passed 21–23 of the 29 tests. Since session 5,
+  summaries keep exact names and strings: 25 of 29 (vanilla 23–24).
+- **Comparing with Fermat.** Fermat reports 0.49x on this bundle, from five
+  sessions per arm. squeeze's mean is 0.47x by the measure above. The methods
+  differ, but the level is similar.
+
+### Hook mode and MCP tools on a subscription
 
 **SWE-Atlas grafana_ts** (SessionBench's TypeScript bundle: 5 refactoring
 tickets in one resumed session, Opus 5.5 as agent, simulated user and judge,
@@ -392,11 +514,11 @@ at its list prices.
 | Agent cost, pair B | $7.88 | $8.25 (1.05x) |
 | **Mean** | **$9.10** | **$8.72 (0.96x)** |
 | Reward, pair A (fractional tests x rubric) | 0.905 | 0.878 |
-| Reward, pair B (squeeze; vanilla still grading) | | 0.921 |
+| Reward, pair B | 0.872 | 0.921 |
 
 What this shows:
 
-- **No measurable saving yet.** Two vanilla sessions of the same setup differed
+- **No measurable saving from hook mode yet.** Two vanilla sessions of the same setup differed
   by 31%, more than any difference between the arms. A claim needs 3–5 sessions
   per arm.
 - **squeeze's own effect is small.** The hook compressed a few outputs, worth
@@ -451,7 +573,8 @@ Contributed results are welcome.
 ## Data and privacy
 
 Everything stays local under `~/.squeeze` (or `$SQUEEZE_HOME`): originals of
-compressed outputs (`blobs/`), per-request stats (`stats.jsonl`), and logs.
+compressed outputs (`blobs/`), per-request stats (`stats.jsonl`), the proxy's
+per-conversation state including compaction summaries (`threads/`), and logs.
 `squeeze gc --days 30` deletes old originals.
 
 ## License
