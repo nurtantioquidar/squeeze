@@ -1134,9 +1134,17 @@ fn opening(marked: bool) -> Value {
 
 /// Send `body` at fake time `at` in session s1, as Claude Code does.
 async fn send_in_session(url: &str, clock: &FakeClock, at: u64, body: &Value) {
+    send_as(url, clock, at, body, None).await;
+}
+
+/// [`send_in_session`], from the subagent `agent` if given.
+async fn send_as(url: &str, clock: &FakeClock, at: u64, body: &Value, agent: Option<&str>) {
     clock.set(at);
     let req = client().post(format!("{url}{MESSAGES}?beta=true")).header("x-api-key", "sk-ant-api03-test");
-    let req = req.header("anthropic-beta", CM_BETAS).header("x-claude-code-session-id", "s1");
+    let mut req = req.header("anthropic-beta", CM_BETAS).header("x-claude-code-session-id", "s1");
+    if let Some(agent) = agent {
+        req = req.header("x-claude-code-agent-id", agent);
+    }
     req.json(body).send().await.unwrap().text().await.unwrap();
     // Let the stream finalizer settle the response.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1196,6 +1204,27 @@ async fn a_turn_too_short_to_summarize_is_kept_warm_through_the_pause() {
     let own = summarizing(&mock);
     assert_eq!(own.len(), 1);
     assert_ne!(own[0].json()["max_tokens"], 1, "a summary");
+}
+
+#[tokio::test]
+async fn a_subagents_reply_is_neither_summarized_nor_kept_warm() {
+    // A subagent's reply ends it: nothing the proxy sent after it would be used.
+    for (body, size) in [(cm_conversation(6, 2), "long enough to summarize"), (opening(true), "short")] {
+        let (clock, dir) = (Arc::new(FakeClock::default()), tempfile::tempdir().unwrap());
+        let (mock, url) = keep_warm_proxy_with(&clock, dir.path(), true, "end_turn").await;
+        send_as(&url, &clock, T0, &body, Some("agent-x")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+        assert_eq!(mock.requests().len(), 1, "a {size} subagent turn: only Claude Code's own request");
+        let recs = Store::open(dir.path()).unwrap().records().unwrap();
+        assert!(recs.iter().all(|r| r.get("compaction").is_none() && r.get("keep_warm").is_none()));
+    }
+
+    // While a subagent's tool call runs, it's kept warm like any other thread.
+    let (clock, dir) = (Arc::new(FakeClock::default()), tempfile::tempdir().unwrap());
+    let (mock, url) = keep_warm_proxy(&clock, dir.path(), true).await;
+    send_as(&url, &clock, T0, &opening(true), Some("agent-x")).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+    assert_eq!(keep_warm_requests(&mock, 1), 1);
 }
 
 #[tokio::test]

@@ -9,7 +9,9 @@
 //! context), any `system`-role messages (Claude Code's environment and tool
 //! announcements) and everything from the final reply on go verbatim, except
 //! that the final reply loses its thinking, which belongs to the summarized
-//! context. A later pause summarizes again, the summary included.
+//! context. A later pause summarizes again, the summary included. A
+//! subagent's turn isn't summarized: its reply ends it, and Claude Code
+//! rarely continues it.
 //!
 //! The summarizing request is squeeze's own, so it leaves out Claude Code's
 //! `claude-code-20250219` beta. Claude Code's cache entries for messages are

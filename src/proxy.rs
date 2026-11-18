@@ -230,6 +230,7 @@ async fn handle(State(inner): State<Arc<Inner>>, req: Request) -> Response {
         job.forwarded = Some(out.clone());
         job.credentials = Credentials::from_headers(&parts.headers);
         job.bound = binding;
+        job.subagent = parts.headers.contains_key("x-claude-code-agent-id");
     }
     let mut headers = forward_headers(&parts.headers);
     if inner.compact.is_some_and(|c| c.warm) {
@@ -312,6 +313,8 @@ struct CompactJob {
     credentials: Option<Credentials>,
     /// It went out with [`compact::THINKING_BINDING_BETA`] added.
     bound: bool,
+    /// A subagent's request (Claude Code names the agent only for those).
+    subagent: bool,
 }
 
 /// What context editing did to a request.
@@ -432,6 +435,7 @@ fn compact_step(inner: &Inner, body: &mut Value, tick: &Tick, is_messages: bool)
             forwarded: None,
             credentials: None,
             bound: false,
+            subagent: false,
         }),
         _ => None,
     };
@@ -746,8 +750,10 @@ impl Pending {
             tracing::warn!("could not write stats: {e}");
         }
         // A turn that ended: summarize its conversation if the thread then
-        // pauses. A tool call to run: with --keep-warm, keep the conversation
-        // cached should it run past the TTL.
+        // pauses. Not a subagent's: its reply ends it, and Claude Code rarely
+        // continues it, so a summary or keep-warm requests would go unused. A
+        // tool call to run (a subagent's too): with --keep-warm, keep the
+        // conversation cached should it run past the TTL.
         let stop = usage.as_ref().and_then(|u| u.stop_reason.as_deref());
         if let (Some(cfg), Some(job), Some(key), Some((started, _))) =
             (self.inner.compact, self.compact, self.thread, self.stamp)
@@ -757,7 +763,7 @@ impl Pending {
         {
             let inner = self.inner.clone();
             match stop {
-                Some("end_turn") => {
+                Some("end_turn") if !job.subagent => {
                     tokio::spawn(compact_later(inner, cfg, key, self.session, model, started, job));
                 }
                 Some("tool_use") if cfg.keep_warm => {
