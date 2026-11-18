@@ -100,15 +100,18 @@ const FIXED_STUB: &str = "[left out of the summary's input: it stays in the conv
 pub const INSTRUCTION: &str = "Stop working on the task for a moment. Your context is about to be compacted: \
 everything after the first message of this conversation will be replaced by a summary you write now, and the work \
 continues from that summary alone (your final reply of this turn, which isn't shown here, stays after it). Write the \
-summary now, in at most about 1,500 words, without calling any tool. Include:
+summary now, in at most about 2,000 words, without calling any tool. Include:
 1. Every user request and instruction so far, in order: quote the latest one in full, and any constraints word for \
 word (for example, files not to modify).
 2. The state of the work: what is done, what remains, and what you were doing last.
-3. Files read, created or changed: their paths, what changed and why, and line ranges worth revisiting.
+3. Files read, created or changed: their paths, what changed and why, and line ranges worth revisiting. For code you \
+wrote, changed or read closely, also keep word for word what someone checking it would look for, since the files may \
+not be there to read again: exported names and signatures, props and their types, user-visible strings and labels, \
+aria-labels and test ids, and which callbacks and handlers things are wired to.
 4. Commands that build, run or test the work, with their latest results, and errors still unresolved.
 5. Decisions made and approaches ruled out, with the reasons.
 6. The next steps.
-Leave out file contents, diffs and raw tool output: they can be read again.";
+Leave out whole file contents, diffs and raw tool output.";
 
 /// Opens the summary where it stands in for the conversation.
 const SUMMARY_OPEN: &str = "<compacted-conversation>\nThe conversation between this first message and the reply that \
