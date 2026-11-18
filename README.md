@@ -353,7 +353,11 @@ refactoring tickets) the way SessionBench does:
 - **Scoring:** SWE-Atlas's own `test.sh` in a fresh container, scored as
   SessionBench's fractional test score, times the rubric. Rubric items are judged
   one call per item with SWE-Atlas's own prompts, or in one call with
-  `--judge-batch`.
+  `--judge-batch`. With `--auth api-key` and a plain API key, each item is one
+  direct API request (adaptive thinking, medium effort, as `claude -p` sends).
+  The ticket and diff, which every item shares, are cached once and read by the
+  others. Re-judging one scapy session this way gave the same verdict on all 77
+  items, for $0.69 instead of $5.08. Other auth keeps `claude -p`.
 
 Setup, once:
 
@@ -500,6 +504,31 @@ vanilla sessions below (on a subscription, Claude Code 2.1.317).
 - **Comparing with Fermat.** Fermat reports 0.49x on this bundle, from five
   sessions per arm. squeeze's mean is 0.47x by the measure above. The methods
   differ, but the level is similar.
+
+**SWE-Atlas scapy_py_scoped** (SessionBench's Python bundle), one session with
+the same setup and the session-5 build (`--compact-pauses --compact-warm
+--keep-warm`):
+
+| Session | squeeze | Same session without squeeze | Ratio | Reward |
+|---|---|---|---|---|
+| 1 | $8.59 | $18.48 | 0.465 | 0.901 |
+
+- **Cost.** The $8.59 is $7.88 of Claude Code's requests, plus $0.71 for five
+  summaries and one keep-warm request. Without the summary written after the
+  last ticket, which nothing used, the ratio is 0.456. Fermat reports 0.50x on
+  this bundle.
+- **Quality.** Rewards for the first four tickets were 0.769, 1.000, 0.833 and
+  1.000. The fifth ticket is left out because its tests check nothing (its
+  rubric scored 0.957). SessionBench reports 0.824 for vanilla and 0.924 for Fermat on
+  this bundle, from a different setup, and there is no vanilla session here.
+  Neither loss traces to a summary:
+  - Ticket 1 ended before the first summary was written.
+  - Ticket 3 failed three hidden tests on exactly the two behaviours the
+    simulated user asked the agent to change (raise `TypeError` for different
+    key sets; no equality shortcut in `__contains__`). The agent applied that
+    request correctly after a mid-ticket summary.
+- **Subagents.** One subagent ran. As designed, squeeze neither summarized it
+  nor kept it warm.
 
 ### Hook mode and MCP tools on a subscription
 
