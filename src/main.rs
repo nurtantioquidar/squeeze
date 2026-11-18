@@ -256,6 +256,23 @@ struct RunArgs {
     claude_args: Vec<String>,
 }
 
+impl RunArgs {
+    /// Flags that work on API requests do nothing in hook mode: refuse them
+    /// there rather than run without what was asked for.
+    fn check_proxy_flags(&self) -> Result<()> {
+        if self.proxy {
+            return Ok(());
+        }
+        if self.compress.context_edits != ContextEdits::Off {
+            bail!("--context-edits works on API requests, so it needs --proxy");
+        }
+        if self.compress.compact_pauses {
+            bail!("--compact-pauses works on API requests, so it needs --proxy");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Args)]
 struct ProxyArgs {
     #[command(flatten)]
@@ -645,9 +662,7 @@ async fn cmd_run(a: RunArgs) -> Result<i32> {
     let started = now_secs();
     let mut args = a.claude_args.clone();
     let mut cmd = tokio::process::Command::new(&a.claude_bin);
-    if !a.proxy && a.compress.context_edits != ContextEdits::Off {
-        bail!("--context-edits works on API requests, so it needs --proxy");
-    }
+    a.check_proxy_flags()?;
 
     let proxy = if a.proxy {
         // Proxy mode sees API traffic, so it is limited to API-key credentials.
@@ -1704,6 +1719,25 @@ mod tests {
     }
 
     #[test]
+    fn run_refuses_proxy_flags_without_the_proxy() {
+        let check = |args: &[&str]| {
+            let Cmd::Run(a) = Cli::try_parse_from(["squeeze", "run"].iter().chain(args)).unwrap().cmd else {
+                panic!("not run")
+            };
+            a.check_proxy_flags()
+        };
+        for flags in [
+            &["--compact-pauses"][..],
+            &["--compact-pauses", "--compact-warm", "--keep-warm"],
+            &["--context-edits", "cold"],
+        ] {
+            assert!(check(flags).is_err(), "{flags:?} without --proxy");
+            assert!(check(&[&["--proxy"][..], flags].concat()).is_ok(), "{flags:?} with --proxy");
+        }
+        assert!(check(&[]).is_ok(), "hook mode with no proxy flags");
+    }
+
+    #[test]
     fn proxied_arms_get_their_flags() {
         let cm = CompressFlags::for_arm(Arm::SqueezeProxyCm, Some("http://u".into())).unwrap();
         let ctx = cm.ctx().unwrap().expect("context editing on");
@@ -1716,6 +1750,17 @@ mod tests {
         let plain = CompressFlags::for_arm(Arm::SqueezeProxy, None).unwrap();
         assert_eq!(plain.ctx().unwrap(), None);
         assert_eq!(plain.transform(ExpandHint::Mcp).unwrap().unwrap().ctx_window, None);
+        assert_eq!(plain.compact().unwrap(), None);
+        let compact = |arm| {
+            let flags = CompressFlags::for_arm(arm, None).unwrap();
+            assert_eq!(flags.ctx().unwrap(), None, "{} edits no context", arm.name());
+            let c = flags.compact().unwrap().expect("compaction on");
+            (c.warm, c.keep_warm, c.min_tokens, c.idle_secs)
+        };
+        let default = squeeze::compact::CompactConfig::default().min_tokens;
+        assert_eq!(compact(Arm::SqueezeProxyCompact), (false, false, default, None));
+        assert_eq!(compact(Arm::SqueezeProxyCompactWarm), (true, false, default, None));
+        assert_eq!(compact(Arm::SqueezeProxyCompactKeepWarm), (true, true, default, None));
         assert!(CompressFlags::for_arm(Arm::Squeeze, None).is_err());
     }
 
