@@ -515,9 +515,8 @@ the same setup and the session-5 build (`--compact-pauses --compact-warm
 | 1 | $8.59 | $18.48 | 0.465 | 0.901 |
 
 - **Cost.** The $8.59 is $7.88 of Claude Code's requests, plus $0.71 for five
-  summaries and one keep-warm request. Without the summary written after the
-  last ticket, which nothing used, the ratio is 0.456. Fermat reports 0.50x on
-  this bundle.
+  summaries and one keep-warm request. Every summary was used. Fermat reports
+  0.50x on this bundle.
 - **Quality.** Rewards for the first four tickets were 0.769, 1.000, 0.833 and
   1.000. The fifth ticket is left out because its tests check nothing (its
   rubric scored 0.957). SessionBench reports 0.824 for vanilla and 0.924 for Fermat on
@@ -539,8 +538,8 @@ one session with the same setup and build:
 | 1 | $4.47 | $8.04 | 0.556 | 1.000 |
 
 - **Cost.** The $4.47 is $4.15 of Claude Code's requests, plus $0.33 for three
-  summaries and three keep-warm requests. Without the summary written after
-  the last ticket, the ratio is 0.546. Fermat reports 0.66x on this bundle.
+  summaries and three keep-warm requests. Every summary was used. Fermat
+  reports 0.66x on this bundle.
 - **Why the ratio is higher here.** This session had fewer cold moments.
   Without squeeze, five requests after the first would have rewritten the whole
   history: $2.92, or 36% of the $8.04. squeeze paid $0.47 for them. Two
